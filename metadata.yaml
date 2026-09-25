@@ -1,0 +1,6 @@
+name: astrbot_plugin_browser
+display_name: 浏览器服务
+desc: 为其他插件提供共享的本地 Chromium 会话、HTML 截图和 PDF 渲染，避免各插件各自实例化浏览器占用大量内存。
+version: 0.1.0
+author: rytte
+astrbot_version: ">=4.27,<5"

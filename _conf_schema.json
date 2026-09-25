@@ -1,0 +1,26 @@
+{
+  "browser_executable": {
+    "description": "浏览器可执行文件路径",
+    "type": "string",
+    "default": "",
+    "hint": "留空使用 Playwright 安装的 Chromium；也可填写本机 Chromium 或 Edge 的绝对路径，不要加引号。配置的浏览器启动失败时不会自动切换。"
+  },
+  "max_concurrent_sessions": {
+    "description": "最大并发页面会话数",
+    "type": "int",
+    "default": 4,
+    "hint": "允许 1～16。每个任务使用独立浏览器上下文。"
+  },
+  "queue_timeout": {
+    "description": "等待会话队列的超时（秒）",
+    "type": "int",
+    "default": 30,
+    "hint": "允许 1～300。队列超时后调用方会收到明确错误。"
+  },
+  "startup_timeout": {
+    "description": "浏览器启动超时（秒）",
+    "type": "int",
+    "default": 30,
+    "hint": "允许 1～120。插件加载时启动并检查浏览器。"
+  }
+}
