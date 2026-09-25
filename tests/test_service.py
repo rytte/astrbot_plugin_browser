@@ -1,5 +1,6 @@
 import asyncio
 import os
+import sys
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, Mock
 
@@ -59,7 +60,10 @@ class FakeBrowser:
 def fake_runtime(monkeypatch):
     browser = FakeBrowser()
     playwright = SimpleNamespace(
-        chromium=SimpleNamespace(launch=AsyncMock(return_value=browser)),
+        chromium=SimpleNamespace(
+            executable_path=sys.executable,
+            launch=AsyncMock(return_value=browser),
+        ),
         stop=AsyncMock(),
     )
     manager = SimpleNamespace(start=AsyncMock(return_value=playwright))
@@ -71,6 +75,71 @@ def fake_runtime(monkeypatch):
         manager=manager,
         factory=factory,
     )
+
+
+def test_find_system_chromium_uses_path(monkeypatch, tmp_path):
+    executable = tmp_path / "chromium"
+    executable.touch()
+    monkeypatch.setattr(
+        service_module.shutil,
+        "which",
+        lambda command: str(executable) if command == "chromium" else None,
+    )
+
+    assert service_module.find_system_chromium() == executable
+
+
+async def test_auto_install_uses_current_python(monkeypatch):
+    process = SimpleNamespace(
+        returncode=0,
+        communicate=AsyncMock(return_value=(b"installed", b"")),
+    )
+    create_process = AsyncMock(return_value=process)
+    monkeypatch.setattr(service_module.asyncio, "create_subprocess_exec", create_process)
+    service = BrowserService()
+
+    await service._install_playwright_chromium()
+
+    create_process.assert_awaited_once_with(
+        sys.executable,
+        "-m",
+        "playwright",
+        "install",
+        "chromium",
+        stdout=service_module.asyncio.subprocess.PIPE,
+        stderr=service_module.asyncio.subprocess.PIPE,
+    )
+    process.communicate.assert_awaited_once()
+
+
+async def test_auto_selects_detected_system_browser(fake_runtime, monkeypatch, tmp_path):
+    executable = tmp_path / "chrome"
+    executable.touch()
+    fake_runtime.playwright.chromium.executable_path = str(tmp_path / "missing")
+    monkeypatch.setattr(service_module, "find_system_chromium", lambda: executable)
+    service = BrowserService()
+
+    await service.initialize()
+
+    fake_runtime.playwright.chromium.launch.assert_awaited_once_with(
+        headless=True,
+        executable_path=str(executable),
+    )
+    await service.close()
+
+
+async def test_missing_browsers_are_installed_automatically(fake_runtime, monkeypatch):
+    fake_runtime.playwright.chromium.executable_path = "missing"
+    monkeypatch.setattr(service_module, "find_system_chromium", lambda: None)
+    install = AsyncMock()
+    service = BrowserService()
+    service._install_playwright_chromium = install
+
+    await service.initialize()
+
+    install.assert_awaited_once()
+    fake_runtime.playwright.chromium.launch.assert_awaited_once_with(headless=True)
+    await service.close()
 
 
 async def test_one_browser_serves_isolated_sessions_and_closes_contexts(fake_runtime):

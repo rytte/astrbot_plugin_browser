@@ -3,7 +3,7 @@
     "description": "浏览器可执行文件路径",
     "type": "string",
     "default": "",
-    "hint": "留空使用 Playwright 安装的 Chromium；也可填写本机 Chromium 或 Edge 的绝对路径，不要加引号。配置的浏览器启动失败时不会自动切换。"
+    "hint": "留空自动选择 Playwright Chromium 或本机 Chromium 系浏览器；找不到时会自动安装 Chromium。也可填写本机浏览器的绝对路径，不要加引号。配置的浏览器启动失败时不会自动切换。"
   },
   "max_concurrent_sessions": {
     "description": "最大并发页面会话数",

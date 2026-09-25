@@ -64,14 +64,21 @@ Chromium（浏览器实例）									# 150～300 MB
 AstrBot/data/plugins/astrbot_plugin_browser/
 ```
 
-在运行 AstrBot 的同一个 Python 环境中安装依赖和 Chromium：
+在运行 AstrBot 的同一个 Python 环境中安装 Python 依赖：
 
 ```bash
 python -m pip install -r data/plugins/astrbot_plugin_browser/requirements.txt
-python -m playwright install chromium
 ```
 
-Linux 如果缺少浏览器系统依赖：
+插件启动时会自动按以下顺序准备 Chromium：
+
+1. 使用 Playwright 已安装的 Chromium。
+2. 查找本机可用的 Chromium、Chrome、Edge、Brave、Vivaldi 或 Opera。
+3. 如果仍未找到，自动执行 `python -m playwright install chromium`。
+
+因此通常不需要手动执行浏览器安装命令。自动下载需要网络和当前 Python 环境的写入权限。
+
+Linux 如果自动下载后仍缺少浏览器系统依赖，可以手动安装：
 
 ```bash
 python -m playwright install --with-deps chromium
@@ -237,12 +244,12 @@ async with browser.session(
 
 | 配置项 | 默认值 | 范围 | 说明 |
 |---|---:|---:|---|
-| `browser_executable` | 空 | 绝对路径 | 留空使用 Playwright Chromium；也可以填写已有 Chromium 或 Edge 的可执行文件路径，不要加引号 |
+| `browser_executable` | 空 | 绝对路径 | 留空自动选择 Playwright Chromium 或本机 Chromium 系浏览器；也可以填写已有浏览器的绝对路径，不要加引号 |
 | `max_concurrent_sessions` | `4` | 1～16 | 同时运行的隔离页面数量；超过后进入队列 |
 | `queue_timeout` | `30` 秒 | 1～300 | 等待并发名额的最长时间 |
 | `startup_timeout` | `30` 秒 | 1～120 | 启动 Chromium 的最长时间 |
 
-浏览器固定以无头模式启动。配置 `browser_executable` 只会改变使用的浏览器程序，不会让它弹出窗口。
+浏览器固定以无头模式启动。配置 `browser_executable` 只会改变使用的浏览器程序，不会让它弹出窗口。显式配置的路径始终优先，路径无效或启动失败时不会自动切换。
 
 ## 🛡️ 默认边界和限制
 
@@ -259,7 +266,7 @@ async with browser.session(
 
 ### 启动失败，提示安装 Chromium
 
-请确认安装命令使用的是启动 AstrBot 的同一个 Python 环境：
+插件会在启动时自动安装 Chromium。如果自动安装失败，请确认网络和写入权限，并使用启动 AstrBot 的同一个 Python 环境手动执行：
 
 ```bash
 python -m playwright install chromium

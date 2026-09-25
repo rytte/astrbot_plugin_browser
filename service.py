@@ -4,6 +4,10 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import os
+import platform
+import shutil
+import sys
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager, suppress
 from pathlib import Path
@@ -19,6 +23,95 @@ MAX_HTML_BYTES = 48 * 1024 * 1024
 MAX_VIEWPORT_PIXELS = 16_777_216
 MAX_SCREENSHOT_PIXELS = 32_000_000
 MAX_TIMEOUT = 300
+BROWSER_INSTALL_TIMEOUT = 300
+
+
+def _system_browser_candidates() -> list[Path]:
+    """Return common Chromium executable locations for the current platform."""
+    candidates: list[Path] = []
+    commands = (
+        "google-chrome",
+        "google-chrome-stable",
+        "chromium",
+        "chromium-browser",
+        "microsoft-edge",
+        "microsoft-edge-stable",
+        "chrome",
+        "msedge",
+        "brave-browser",
+        "vivaldi",
+        "opera",
+    )
+    for command in commands:
+        executable = shutil.which(command)
+        if executable:
+            candidates.append(Path(executable))
+
+    system = platform.system()
+    if system == "Windows":
+        roots = [
+            os.environ.get("PROGRAMFILES"),
+            os.environ.get("PROGRAMFILES(X86)"),
+            os.environ.get("LOCALAPPDATA"),
+        ]
+        relative_paths = (
+            "Google\\Chrome\\Application\\chrome.exe",
+            "Microsoft\\Edge\\Application\\msedge.exe",
+            "Chromium\\Application\\chrome.exe",
+            "BraveSoftware\\Brave-Browser\\Application\\brave.exe",
+            "Vivaldi\\Application\\vivaldi.exe",
+            "Programs\\Opera\\opera.exe",
+        )
+        candidates.extend(
+            Path(root) / relative
+            for root in roots
+            if root
+            for relative in relative_paths
+        )
+    elif system == "Darwin":
+        app_roots = (Path("/Applications"), Path.home() / "Applications")
+        app_paths = (
+            "Google Chrome.app/Contents/MacOS/Google Chrome",
+            "Microsoft Edge.app/Contents/MacOS/Microsoft Edge",
+            "Chromium.app/Contents/MacOS/Chromium",
+            "Brave Browser.app/Contents/MacOS/Brave Browser",
+            "Vivaldi.app/Contents/MacOS/Vivaldi",
+            "Opera.app/Contents/MacOS/Opera",
+        )
+        candidates.extend(root / relative for root in app_roots for relative in app_paths)
+    else:
+        candidates.extend(
+            Path(path)
+            for path in (
+                "/usr/bin/google-chrome",
+                "/usr/bin/google-chrome-stable",
+                "/usr/bin/chromium",
+                "/usr/bin/chromium-browser",
+                "/usr/bin/microsoft-edge",
+                "/usr/bin/microsoft-edge-stable",
+                "/usr/bin/brave-browser",
+                "/usr/bin/vivaldi",
+                "/usr/bin/opera",
+                "/snap/bin/chromium",
+            )
+        )
+    return candidates
+
+
+def find_system_chromium() -> Path | None:
+    """Find an existing Chromium-compatible browser without starting it."""
+    seen: set[Path] = set()
+    for candidate in _system_browser_candidates():
+        try:
+            candidate = candidate.expanduser()
+        except RuntimeError:
+            continue
+        if candidate in seen:
+            continue
+        seen.add(candidate)
+        if candidate.is_file():
+            return candidate
+    return None
 
 
 class BrowserServiceError(RuntimeError):
@@ -57,7 +150,7 @@ class BrowserService:
             path = Path(browser_executable)
             if not path.is_absolute() or not path.is_file():
                 raise BrowserServiceError(
-                    "browser_executable 必须指向已存在的 Chromium 或 Edge 可执行文件。"
+                    "browser_executable 必须指向已存在的 Chromium 系浏览器可执行文件。"
                 )
         if (
             type(max_concurrent_sessions) is not int
@@ -100,11 +193,66 @@ class BrowserService:
         if self._closing or self._closed:
             raise BrowserServiceError("浏览器服务已停止。")
         try:
-            await asyncio.wait_for(self._ensure_browser(), timeout=self.startup_timeout)
+            await asyncio.wait_for(
+                self._ensure_browser(), timeout=self._browser_start_timeout
+            )
         except asyncio.TimeoutError as exc:
             raise BrowserServiceError(
-                f"浏览器启动超过 {self.startup_timeout} 秒。"
+                f"浏览器启动或自动安装超过 {self._browser_start_timeout} 秒。"
             ) from exc
+
+    @property
+    def _browser_start_timeout(self) -> int:
+        """Allow the first startup to include a one-time browser download."""
+        if self.browser_executable:
+            return self.startup_timeout
+        return self.startup_timeout + BROWSER_INSTALL_TIMEOUT
+
+    async def _install_playwright_chromium(self) -> None:
+        """Install Playwright's bundled Chromium in the current Python environment."""
+        logger.info("No Chromium executable found; installing Playwright Chromium")
+        try:
+            process = await asyncio.create_subprocess_exec(
+                sys.executable,
+                "-m",
+                "playwright",
+                "install",
+                "chromium",
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+            )
+        except OSError as exc:
+            raise BrowserServiceError(
+                "无法自动安装 Playwright Chromium。请确认当前 Python 环境可执行 "
+                "python -m playwright install chromium。"
+            ) from exc
+
+        try:
+            stdout, stderr = await asyncio.wait_for(
+                process.communicate(), timeout=BROWSER_INSTALL_TIMEOUT
+            )
+        except asyncio.TimeoutError as exc:
+            with suppress(ProcessLookupError):
+                process.kill()
+            await process.communicate()
+            raise BrowserServiceError(
+                f"自动安装 Playwright Chromium 超过 {BROWSER_INSTALL_TIMEOUT} 秒。"
+            ) from exc
+        except asyncio.CancelledError:
+            with suppress(ProcessLookupError):
+                process.kill()
+            await process.communicate()
+            raise
+
+        if process.returncode != 0:
+            details = (stderr or stdout or b"").decode("utf-8", errors="replace")
+            details = details.strip()[-1000:]
+            suffix = f"\n安装输出：{details}" if details else ""
+            raise BrowserServiceError(
+                "自动安装 Playwright Chromium 失败，请检查网络和写入权限，或手动运行 "
+                "python -m playwright install chromium。"
+                + suffix
+            )
 
     async def _ensure_browser(self) -> Browser:
         if self._closing or self._closed:
@@ -114,24 +262,50 @@ class BrowserService:
                 return self._browser
 
             await self._stop_runtime()
+            selected_executable: Path | None = None
             try:
                 self._playwright = await async_playwright().start()
                 launch_options: dict[str, Any] = {"headless": True}
                 if self.browser_executable:
                     launch_options["executable_path"] = self.browser_executable
-                self._browser = await self._playwright.chromium.launch(**launch_options)
+                else:
+                    bundled_path = getattr(
+                        self._playwright.chromium, "executable_path", ""
+                    ) or ""
+                    bundled_executable = Path(bundled_path)
+                    if not bundled_executable.is_file():
+                        selected_executable = find_system_chromium()
+                        if selected_executable is not None:
+                            launch_options["executable_path"] = str(selected_executable)
+                            logger.info(
+                                "Using detected Chromium executable: %s",
+                                selected_executable,
+                            )
+                        else:
+                            await self._install_playwright_chromium()
+                try:
+                    self._browser = await asyncio.wait_for(
+                        self._playwright.chromium.launch(**launch_options),
+                        timeout=self.startup_timeout,
+                    )
+                except asyncio.TimeoutError as exc:
+                    raise BrowserServiceError(
+                        f"浏览器启动超过 {self.startup_timeout} 秒。"
+                    ) from exc
                 return self._browser
             except BaseException as exc:
                 await self._stop_runtime()
                 if isinstance(exc, asyncio.CancelledError):
                     raise
+                if isinstance(exc, BrowserServiceError):
+                    raise
                 logger.exception("Shared browser failed to start")
-                if self.browser_executable:
+                if self.browser_executable or selected_executable is not None:
                     raise BrowserServiceError(
-                        "配置的浏览器启动失败；不会自动切换到其他浏览器。"
+                        "配置或自动发现的浏览器启动失败；不会自动切换到其他浏览器。"
                     ) from exc
                 raise BrowserServiceError(
-                    "Playwright Chromium 启动失败。请在 AstrBot 使用的 Python 环境中运行 "
+                    "Playwright Chromium 启动失败。请检查浏览器依赖，或运行 "
                     "python -m playwright install chromium。"
                 ) from exc
 
@@ -247,7 +421,7 @@ class BrowserService:
             if self._closing or self._closed:
                 raise BrowserServiceError("浏览器服务不可用。")
             browser = await asyncio.wait_for(
-                self._ensure_browser(), timeout=self.startup_timeout
+                self._ensure_browser(), timeout=self._browser_start_timeout
             )
             context = await browser.new_context(
                 viewport=viewport,
