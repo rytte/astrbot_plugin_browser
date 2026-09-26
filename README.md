@@ -28,8 +28,8 @@ AstrBot
 ```bash
 Chromium（浏览器实例）									# 150～300 MB
 └── BrowserContext（独立会话：Cookie、登录状态、缓存等）  # 10～60 MB
-    ├── Page（标签页）								 # 20–100 MB
-    └── Page（标签页）								 # 20–100 MB
+    ├── Page（标签页）								 # 10～80 MB
+    └── Page（标签页）								 # 10～80 MB
 ```
 
 ### 任务之间互相隔离

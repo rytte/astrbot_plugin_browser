@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import asyncio
-import logging
 import os
 import platform
 import shutil
@@ -13,10 +12,9 @@ from contextlib import asynccontextmanager, suppress
 from pathlib import Path
 from typing import Any
 
+from astrbot.api import logger
 from playwright.async_api import Browser, Page, Playwright, async_playwright
 from playwright.async_api import Error as PlaywrightError
-
-logger = logging.getLogger("astrbot")
 
 DEFAULT_VIEWPORT = {"width": 1280, "height": 720}
 MAX_HTML_BYTES = 48 * 1024 * 1024
