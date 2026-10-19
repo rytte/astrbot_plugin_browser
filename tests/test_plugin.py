@@ -12,6 +12,7 @@ from astrbot_plugin_browser.main import BrowserPlugin
 from astrbot_plugin_browser.service import BrowserServiceError
 
 BASE_TOOLS = {
+    "browser_mode",
     "browser_open",
     "browser_close",
     "browser_observe",
@@ -119,6 +120,7 @@ def test_plugin_reads_grouped_browser_use_settings():
         ({"browser_use": {"unknown": True}}, "未知 BrowserUse 配置"),
         ({"browser_use": {"enabled": "false"}}, "enabled 必须是布尔值"),
         ({"browser_use": {"enabled": 0}}, "enabled 必须是布尔值"),
+        ({"browser_use": {"headed_enabled": 0}}, "headed_enabled 必须是布尔值"),
         ({"browser_use": {"max_sessions": 0}}, "browser_use.max_sessions"),
         ({"browser_use": {"idle_timeout": 0}}, "browser_use.idle_timeout"),
         ({"browser_use": {"action_timeout": 0}}, "browser_use.action_timeout"),
@@ -145,6 +147,7 @@ def test_schema_loads_both_configuration_groups(tmp_path):
         },
         "browser_use": {
             "enabled": True,
+            "headed_enabled": True,
             "tool_level": "basic",
             "max_sessions": 4,
             "idle_timeout": 600,
@@ -172,7 +175,7 @@ def tool_manager():
             tool = copy(tool)
             tool.handler_module_path = BrowserPlugin.__module__
             manager.func_list.append(tool)
-    assert len(manager.func_list) == 22
+    assert len(manager.func_list) == 23
     return manager
 
 
@@ -231,12 +234,12 @@ async def test_enabled_browser_use_preserves_tool_activation(tool_manager):
     try:
         await plugin.initialize()
         assert plugin.agent._reaper is not None
-        assert len(tool_manager.func_list) == 12
+        assert len(tool_manager.func_list) == 13
         names = {
             item["function"]["name"]
             for item in tool_manager.get_func_desc_openai_style()
         }
-        assert len(names) == 11
+        assert len(names) == 12
         assert "browser_open" not in names
         assert "browser_screenshot" in names
     finally:
@@ -348,6 +351,7 @@ def test_all_tools_registered_with_parameter_descriptions():
         if tool.name.startswith("browser_")
     }
     assert set(tools) == {
+        "browser_mode",
         "browser_open",
         "browser_observe",
         "browser_screenshot",
@@ -612,9 +616,9 @@ async def test_attachment_error_is_visible_and_does_not_expose_local_paths(tmp_p
 @pytest.mark.parametrize(
     ("level", "expected", "count"),
     [
-        ("basic", BASE_TOOLS, 12),
-        ("standard", STANDARD_TOOLS, 18),
-        ("full", FULL_TOOLS, 22),
+        ("basic", BASE_TOOLS, 13),
+        ("standard", STANDARD_TOOLS, 19),
+        ("full", FULL_TOOLS, 23),
     ],
 )
 async def test_tool_levels_expose_exact_definitions_without_changing_other_plugins(
@@ -646,7 +650,7 @@ async def test_tool_levels_expose_exact_definitions_without_changing_other_plugi
         await plugin.terminate()
 
 
-async def test_enabling_all_advanced_tools_exposes_22_and_preserves_activation(
+async def test_enabling_all_advanced_tools_exposes_23_and_preserves_activation(
     tool_manager,
 ):
     context = SimpleNamespace(get_llm_tool_manager=lambda: tool_manager)
@@ -656,12 +660,12 @@ async def test_enabling_all_advanced_tools_exposes_22_and_preserves_activation(
     tool_manager.get_func("browser_evaluate").active = False
     try:
         await plugin.initialize()
-        assert len(tool_manager.func_list) == 22
+        assert len(tool_manager.func_list) == 23
         names = {
             item["function"]["name"]
             for item in tool_manager.get_func_desc_openai_style()
         }
-        assert len(names) == 21
+        assert len(names) == 22
         assert "browser_evaluate" not in names
     finally:
         await plugin.terminate()

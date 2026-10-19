@@ -1,4 +1,4 @@
-"""Manage a shared Chromium process and isolated rendering sessions."""
+"""Manage a resident headless Chromium and an optional headed Chromium."""
 
 from __future__ import annotations
 
@@ -119,7 +119,7 @@ class BrowserServiceError(RuntimeError):
 
 
 class BrowserService:
-    """Own one Chromium process and create disposable contexts for each task.
+    """Own shared Chromium runtimes and create isolated contexts for each task.
 
     Args:
         browser_executable: Optional absolute path to a Chromium-based browser.
@@ -168,8 +168,13 @@ class BrowserService:
         self.startup_timeout = startup_timeout
         self._semaphore = asyncio.Semaphore(max_concurrent_sessions)
         self._lifecycle_lock = asyncio.Lock()
+        self._headed_lock = asyncio.Lock()
+        self._runtime_lock = asyncio.Lock()
         self._playwright: Playwright | None = None
         self._browser: Browser | None = None
+        self._headed_browser: Browser | None = None
+        self._launch_options: dict[str, Any] = {}
+        self._launching = 0
         self._active_tasks: set[asyncio.Task[Any]] = set()
         self._closing = False
         self._closed = False
@@ -253,37 +258,57 @@ class BrowserService:
                 "python -m playwright install chromium。" + suffix
             )
 
-    async def _ensure_browser(self) -> Browser:
-        if self._closing or self._closed:
-            raise BrowserServiceError("浏览器服务正在停止。")
-        async with self._lifecycle_lock:
-            if self._browser is not None and self._browser.is_connected():
-                return self._browser
-
-            await self._stop_runtime()
-            selected_executable: Path | None = None
+    async def _runtime_options(self) -> dict[str, Any]:
+        async with self._runtime_lock:
+            if self._playwright is not None:
+                return dict(self._launch_options)
+            runtime = await async_playwright().start()
+            options: dict[str, Any] = {}
             try:
-                self._playwright = await async_playwright().start()
-                launch_options: dict[str, Any] = {"headless": True}
                 if self.browser_executable:
-                    launch_options["executable_path"] = self.browser_executable
+                    options["executable_path"] = self.browser_executable
                 else:
-                    bundled_path = (
-                        getattr(self._playwright.chromium, "executable_path", "") or ""
+                    bundled = Path(
+                        getattr(runtime.chromium, "executable_path", "") or ""
                     )
-                    bundled_executable = Path(bundled_path)
-                    if not bundled_executable.is_file():
-                        selected_executable = find_system_chromium()
-                        if selected_executable is not None:
-                            launch_options["executable_path"] = str(selected_executable)
+                    if not bundled.is_file():
+                        selected = find_system_chromium()
+                        if selected is not None:
+                            options["executable_path"] = str(selected)
                             logger.info(
-                                "Using detected Chromium executable: %s",
-                                selected_executable,
+                                "Using detected Chromium executable: %s", selected
                             )
                         else:
                             await self._install_playwright_chromium()
+            except BaseException:
+                await runtime.stop()
+                raise
+            self._playwright = runtime
+            self._launch_options = options
+            return dict(options)
+
+    async def _ensure_browser(self, mode: str = "headless") -> Browser:
+        if mode not in {"headless", "headed"}:
+            raise BrowserServiceError("浏览器模式必须是 headless 或 headed。")
+        if self._closing or self._closed:
+            raise BrowserServiceError("浏览器服务正在停止。")
+        lock = self._headed_lock if mode == "headed" else self._lifecycle_lock
+        async with lock:
+            if self._closing or self._closed:
+                raise BrowserServiceError("浏览器服务正在停止。")
+            browser = self._headed_browser if mode == "headed" else self._browser
+            if browser is not None and browser.is_connected():
+                return browser
+            if mode == "headed":
+                self._headed_browser = None
+            else:
+                self._browser = None
+            self._launching += 1
+            try:
+                launch_options = await self._runtime_options()
+                launch_options["headless"] = mode == "headless"
                 try:
-                    self._browser = await asyncio.wait_for(
+                    browser = await asyncio.wait_for(
                         self._playwright.chromium.launch(**launch_options),
                         timeout=self.startup_timeout,
                     )
@@ -291,15 +316,24 @@ class BrowserService:
                     raise BrowserServiceError(
                         f"浏览器启动超过 {self.startup_timeout} 秒。"
                     ) from exc
-                return self._browser
+                if mode == "headed":
+                    self._headed_browser = browser
+                else:
+                    self._browser = browser
+                return browser
             except BaseException as exc:
-                await self._stop_runtime()
                 if isinstance(exc, asyncio.CancelledError):
                     raise
                 if isinstance(exc, BrowserServiceError):
                     raise
-                logger.exception("Shared browser failed to start")
-                if self.browser_executable or selected_executable is not None:
+                logger.exception("%s browser failed to start", mode)
+                if mode == "headed":
+                    raise BrowserServiceError(
+                        "有头浏览器启动失败，请确认 AstrBot 所在主机具有可用的图形桌面和浏览器依赖。"
+                    ) from exc
+                if self.browser_executable or self._launch_options.get(
+                    "executable_path"
+                ):
                     raise BrowserServiceError(
                         "配置或自动发现的浏览器启动失败；不会自动切换到其他浏览器。"
                     ) from exc
@@ -307,11 +341,36 @@ class BrowserService:
                     "Playwright Chromium 启动失败。请检查浏览器依赖，或运行 "
                     "python -m playwright install chromium。"
                 ) from exc
+            finally:
+                self._launching -= 1
+                async with self._runtime_lock:
+                    if (
+                        self._launching == 0
+                        and self._browser is None
+                        and self._headed_browser is None
+                    ):
+                        await self._stop_runtime()
+
+    async def close_headed(self, browser: Browser | None = None) -> None:
+        """Release only the optional headed process, retaining the shared driver."""
+        async with self._headed_lock:
+            if browser is not None and self._headed_browser is not browser:
+                return
+            current, self._headed_browser = self._headed_browser, None
+            if current is not None:
+                try:
+                    await asyncio.wait_for(current.close(), timeout=5)
+                except (PlaywrightError, asyncio.TimeoutError):
+                    logger.warning("Failed to close headed Chromium", exc_info=True)
 
     async def _stop_runtime(self) -> None:
         browser, self._browser = self._browser, None
+        headed, self._headed_browser = self._headed_browser, None
         playwright, self._playwright = self._playwright, None
-        if browser is not None:
+        self._launch_options = {}
+        for browser in (headed, browser):
+            if browser is None:
+                continue
             try:
                 await browser.close()
             except Exception:
@@ -327,8 +386,11 @@ class BrowserService:
         await route.abort()
 
     @asynccontextmanager
-    async def operation(self) -> AsyncIterator[Browser]:
+    async def operation(self, mode: str = "headless") -> AsyncIterator[Browser]:
         """Reserve execution capacity without retaining it between agent turns.
+
+        Args:
+            mode: Select the resident headless or lazily started headed browser.
 
         Yields:
             The connected shared browser.
@@ -354,7 +416,7 @@ class BrowserService:
             if self._closing or self._closed:
                 raise BrowserServiceError("浏览器服务不可用。")
             yield await asyncio.wait_for(
-                self._ensure_browser(), timeout=self._browser_start_timeout
+                self._ensure_browser(mode), timeout=self._browser_start_timeout
             )
         finally:
             if acquired:
@@ -659,6 +721,7 @@ class BrowserService:
         if tasks:
             await asyncio.gather(*tasks, return_exceptions=True)
         async with self._lifecycle_lock:
-            await self._stop_runtime()
+            async with self._headed_lock:
+                await self._stop_runtime()
         self._closed = True
         self._closing = False

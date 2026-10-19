@@ -45,20 +45,26 @@
         "type": "string",
         "default": "basic",
         "options": ["basic", "standard", "full"],
-        "labels": ["基础浏览（12 个工具）", "完整交互（18 个工具）", "高级控制（22 个工具）"],
+        "labels": ["基础浏览（13 个工具）", "完整交互（19 个工具）", "高级控制（23 个工具）"],
         "hint": "高层包含低层全部工具，未启用的工具不占上下文。"
+      },
+      "headed_enabled": {
+        "description": "允许按需使用有头浏览器",
+        "type": "bool",
+        "default": true,
+        "hint": "只有明确调用 browser_mode(headed) 才启动窗口，显示在 AstrBot 所在主机的图形桌面；最多一个有头实例和一个有头会话，用完释放。无头浏览器和渲染始终保持原模式。"
       },
       "max_sessions": {
         "description": "保留的 Agent 浏览器会话上限",
         "type": "int",
         "default": 4,
-        "hint": "允许 1～16。每个消息来源和发送者使用独立的联网浏览器会话；空闲会话不占执行并发名额。"
+        "hint": "允许 1～16。每个消息来源和发送者使用独立的联网浏览器会话，有头和无头合计计数；空闲会话不占执行并发名额。"
       },
       "idle_timeout": {
         "description": "Agent 会话空闲回收时间（秒）",
         "type": "int",
         "default": 600,
-        "hint": "允许 30～3600。空闲到期自动保存个人登录快照后关闭会话，下次创建会话时自动恢复；显式 clear 后当前会话不再自动保存。"
+        "hint": "允许 30～3600。有头模式的人工点击、键盘和滚动也会刷新空闲计时。空闲到期自动保存后关闭会话，有头实例同时释放；显式 clear 后当前会话不再自动保存。"
       },
       "action_timeout": {
         "description": "Agent 单次工具总超时（秒）",

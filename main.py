@@ -53,6 +53,7 @@ class BrowserPlugin(Star):
             "max_sessions",
             "idle_timeout",
             "action_timeout",
+            "headed_enabled",
         }
         if unknown:
             raise BrowserServiceError(
@@ -75,6 +76,7 @@ class BrowserPlugin(Star):
             action_timeout=browser_use.get("action_timeout", 30),
             data_dir=StarTools.get_data_dir("astrbot_plugin_browser"),
             tool_level=browser_use.get("tool_level", "basic"),
+            headed_enabled=browser_use.get("headed_enabled", True),
         )
         self._tool_tasks: set[asyncio.Task] = set()
 
@@ -234,6 +236,17 @@ class BrowserPlugin(Star):
             except Exception:
                 errors.append(f"附件 {index + 1} 无法读取，请重新发送附件。")
         return errors
+
+    @llm_tool(name="browser_mode")
+    async def browser_mode(
+        self, event: AstrMessageEvent, mode: str = "status"
+    ) -> CallToolResult:
+        """查询或切换个人浏览器模式。默认无头，只有用户明确需要可见窗口时才切换 headed。窗口显示在 AstrBot 所在主机。最多一个有头会话；占用时不会抢占。切换保留登录存储但重建页面，不写磁盘，之后需 browser_open。关闭会话后默认回到无头。
+
+        Args:
+            mode(string): status 查询且不启动浏览器；headed 切换有头；headless 切回无头。
+        """
+        return await self._tool(event, "mode", mode=mode)
 
     @llm_tool(name="browser_open")
     async def browser_open(

@@ -274,6 +274,109 @@ async def test_startup_failure_is_actionable_and_stops_playwright(fake_runtime):
     assert not service.ready
 
 
+async def test_headed_browser_is_lazy_singleton_and_keeps_headless_runtime(
+    fake_runtime,
+):
+    headed = FakeBrowser()
+    fake_runtime.playwright.chromium.launch.side_effect = [fake_runtime.browser, headed]
+    service = BrowserService()
+    await service.initialize()
+    assert service._headed_browser is None
+    instances = await asyncio.gather(
+        *(service._ensure_browser("headed") for _ in range(3))
+    )
+    assert all(browser is headed for browser in instances)
+    assert fake_runtime.playwright.chromium.launch.await_count == 2
+    assert fake_runtime.playwright.chromium.launch.await_args.kwargs == {
+        "headless": False
+    }
+    await service.close_headed(headed)
+    headed.close.assert_awaited_once()
+    fake_runtime.browser.close.assert_not_awaited()
+    fake_runtime.playwright.stop.assert_not_awaited()
+    assert service.ready and service._headed_browser is None
+    assert await service.render_html("<html>still running</html>") == b"page-png"
+    await service.close()
+    fake_runtime.playwright.stop.assert_awaited_once()
+
+
+async def test_headed_launch_failure_does_not_stop_headless(fake_runtime):
+    fake_runtime.playwright.chromium.launch.side_effect = [
+        fake_runtime.browser,
+        PlaywrightError("no display"),
+    ]
+    service = BrowserService()
+    await service.initialize()
+    with pytest.raises(BrowserServiceError, match="有头浏览器启动失败"):
+        async with service.operation("headed"):
+            pass
+    assert service.ready and service._headed_browser is None
+    fake_runtime.playwright.stop.assert_not_awaited()
+    assert await service.render_html("<html>ok</html>") == b"page-png"
+    await service.close()
+
+
+async def test_headed_launch_does_not_block_headless_operations(fake_runtime):
+    service = BrowserService()
+    await service.initialize()
+    started, release = asyncio.Event(), asyncio.Event()
+    headed = FakeBrowser()
+
+    async def launch(**kwargs):
+        started.set()
+        await release.wait()
+        return headed
+
+    fake_runtime.playwright.chromium.launch.side_effect = launch
+    task = asyncio.create_task(service._ensure_browser("headed"))
+    try:
+        await asyncio.wait_for(started.wait(), timeout=1)
+        assert (
+            await asyncio.wait_for(service.render_html("<html>ok</html>"), timeout=1)
+            == b"page-png"
+        )
+    finally:
+        release.set()
+        await task
+        await service.close()
+
+
+async def test_headless_restart_preserves_headed_and_driver(fake_runtime):
+    headed, replacement = FakeBrowser(), FakeBrowser()
+    fake_runtime.playwright.chromium.launch.side_effect = [
+        fake_runtime.browser,
+        headed,
+        replacement,
+    ]
+    service = BrowserService()
+    await service.initialize()
+    await service._ensure_browser("headed")
+    fake_runtime.browser._connected = False
+    assert await service._ensure_browser() is replacement
+    assert service._headed_browser is headed
+    headed.close.assert_not_awaited()
+    fake_runtime.playwright.stop.assert_not_awaited()
+    await service.close()
+
+
+async def test_stale_headed_close_does_not_close_replacement(fake_runtime):
+    first, second = FakeBrowser(), FakeBrowser()
+    fake_runtime.playwright.chromium.launch.side_effect = [
+        fake_runtime.browser,
+        first,
+        second,
+    ]
+    service = BrowserService()
+    await service.initialize()
+    await service._ensure_browser("headed")
+    await service.close_headed(first)
+    await service._ensure_browser("headed")
+    await service.close_headed(first)
+    assert service._headed_browser is second
+    second.close.assert_not_awaited()
+    await service.close()
+
+
 def test_invalid_viewports_and_limits_fail_before_startup():
     with pytest.raises(BrowserServiceError, match="viewport"):
         BrowserService._validate_viewport({"width": True, "height": 720})

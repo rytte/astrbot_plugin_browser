@@ -43,8 +43,20 @@ EXTRACT_SCRIPT = Path(__file__).with_name("extraction.js").read_text(encoding="u
 MAX_TABS = 8
 MAX_FRAMES = 16
 STATE_SAVE_TIMEOUT = 5
+ACTIVITY_SCRIPT = """(() => {
+    let last = -Infinity;
+    const activity = event => {
+        const now = performance.now();
+        if (!event.isTrusted || now - last < 1000) return;
+        last = now;
+        window.__astrbot_browser_activity().catch(() => {});
+    };
+    for (const name of ['pointerdown', 'keydown', 'input', 'wheel', 'touchstart', 'scroll'])
+        addEventListener(name, activity, {capture: true, passive: true});
+})();"""
 Owner = tuple[str, str]
 ACTION_PARAMETERS = {
+    "mode": {"mode"},
     "open": {"url", "new_tab"},
     "observe": set(),
     "screenshot": set(),
@@ -93,6 +105,10 @@ class AgentSession:
 
     context: BrowserContext
     owner: Owner = ("", "")
+    mode: str = "headless"
+    closing: bool = False
+    context_closed: bool = False
+    disconnect_handler: Any = None
     lock: asyncio.Lock = field(default_factory=asyncio.Lock)
     tabs: dict[str, Page] = field(default_factory=dict)
     active_tab: str = ""
@@ -138,6 +154,7 @@ class AgentBrowser:
         action_timeout: Total seconds allowed for a tool call, including queueing.
         data_dir: Plugin-owned directory for login snapshots and temporary files.
         tool_level: Cumulative model tool level: basic, standard or full.
+        headed_enabled: Allow explicit requests for the exclusive visible session.
     """
 
     def __init__(
@@ -149,6 +166,7 @@ class AgentBrowser:
         action_timeout: int = 30,
         data_dir: Path | None = None,
         tool_level: str = "basic",
+        headed_enabled: bool = True,
     ) -> None:
         for key, value, lower, upper in (
             ("browser_use.max_sessions", max_sessions, 1, 16),
@@ -157,6 +175,9 @@ class AgentBrowser:
         ):
             if type(value) is not int or not lower <= value <= upper:
                 raise BrowserServiceError(f"{key} 必须是 {lower}～{upper} 的整数。")
+        if type(headed_enabled) is not bool:
+            raise BrowserServiceError("browser_use.headed_enabled 必须是布尔值。")
+        self.headed_enabled = headed_enabled
         self.service = service
         self.max_sessions = max_sessions
         self.idle_timeout = idle_timeout
@@ -166,6 +187,9 @@ class AgentBrowser:
         self.storage = BrowserStorage(data_dir)
         self._sessions: dict[Owner, AgentSession] = {}
         self._registry_lock = asyncio.Lock()
+        self._owner_locks: dict[Owner, asyncio.Lock] = {}
+        self._creating: set[Owner] = set()
+        self._headed_owner: Owner | None = None
         self._tasks: set[asyncio.Task[Any]] = set()
         self._maintenance: set[asyncio.Task[Any]] = set()
         self._reaper: asyncio.Task[None] | None = None
@@ -185,15 +209,51 @@ class AgentBrowser:
 
     async def reap_idle(self) -> None:
         """Close expired sessions without interrupting an operation in progress."""
-        async with self._registry_lock:
-            expired = [
-                owner
-                for owner, session in self._sessions.items()
-                if not session.lock.locked()
-                and time.monotonic() - session.last_used >= self.idle_timeout
-            ]
-            for owner in expired:
-                await self._drop(owner, self._sessions[owner], save_state=True)
+        for owner, session in list(self._sessions.items()):
+            lock = self._owner_lock(owner)
+            if lock.locked() or session.lock.locked():
+                continue
+            async with lock:
+                if (
+                    self._sessions.get(owner) is session
+                    and time.monotonic() - session.last_used >= self.idle_timeout
+                ):
+                    await self._drop(owner, session, save_state=True)
+
+    def _owner_lock(self, owner: Owner) -> asyncio.Lock:
+        return self._owner_locks.setdefault(owner, asyncio.Lock())
+
+    def _schedule_external_close(self, session: AgentSession) -> None:
+        if (
+            self._closed
+            or session.closing
+            or self._sessions.get(session.owner) is not session
+        ):
+            return
+        task = asyncio.create_task(self._external_close(session))
+        self._maintenance.add(task)
+
+        def finished(task: asyncio.Task[Any]) -> None:
+            self._maintenance.discard(task)
+            if not task.cancelled() and task.exception() is not None:
+                logger.warning(
+                    "Failed to clean up a closed headed session",
+                    exc_info=task.exception(),
+                )
+
+        task.add_done_callback(finished)
+
+    async def _external_close(self, session: AgentSession) -> None:
+        async with self._owner_lock(session.owner):
+            if self._sessions.get(session.owner) is not session or session.closing:
+                return
+            if not session.context_closed and any(
+                not p.is_closed() for p in session.tabs.values()
+            ):
+                return
+            await self._drop(
+                session.owner, session, save_state=not session.context_closed
+            )
 
     async def _save_on_close(self, owner: Owner, session: AgentSession) -> bool | None:
         """Best-effort final snapshot; a cleared session must stay cleared."""
@@ -214,10 +274,16 @@ class AgentBrowser:
             return False
 
     async def _drop(
-        self, owner: Owner, session: AgentSession, *, save_state: bool = False
+        self,
+        owner: Owner,
+        session: AgentSession,
+        *,
+        save_state: bool = False,
+        release_headed: bool = True,
     ) -> bool | None:
         saved = None
         defer_close = False
+        session.closing = True
         try:
             if save_state and self._sessions.get(owner) is session:
                 saved = await self._save_on_close(owner, session)
@@ -238,46 +304,64 @@ class AgentBrowser:
                 finally:
                     session.refs.clear()
                     session.snapshots.clear()
+                    if session.disconnect_handler is not None:
+                        browser = session.context.browser
+                        if browser is not None:
+                            browser.remove_listener(
+                                "disconnected", session.disconnect_handler
+                            )
+                    if session.mode == "headed" and release_headed:
+                        try:
+                            await self.service.close_headed(session.context.browser)
+                        finally:
+                            if self._headed_owner == owner:
+                                self._headed_owner = None
         return saved
 
     async def _get_session(
-        self, owner: Owner, browser: Browser, *, create: bool
+        self, owner: Owner, browser: Browser, *, create: bool, mode: str = "headless"
     ) -> AgentSession:
-        async with self._registry_lock:
-            if self._closed:
-                raise AgentBrowserError("SERVICE_CLOSED", "Agent 浏览器服务已停止。")
-            session = self._sessions.get(owner)
-            if session is not None:
-                if session.context.browser is not browser:
-                    await self._drop(owner, session)
-                    raise AgentBrowserError(
-                        "SESSION_LOST",
-                        "浏览器已重启，原页面和登录态已失效，请重新打开网址。",
-                    )
-                if (
-                    not session.lock.locked()
-                    and time.monotonic() - session.last_used >= self.idle_timeout
-                ):
-                    await self._drop(owner, session, save_state=True)
-                    raise AgentBrowserError(
-                        "SESSION_EXPIRED", "浏览器会话已空闲过期，请重新打开网址。"
-                    )
-                return session
-            if not create:
+        if self._closed:
+            raise AgentBrowserError("SERVICE_CLOSED", "Agent 浏览器服务已停止。")
+        session = self._sessions.get(owner)
+        if session is not None:
+            if session.context.browser is not browser:
+                await self._drop(owner, session)
                 raise AgentBrowserError(
-                    "NO_SESSION", "当前没有浏览器会话，请先调用 browser_open。"
+                    "SESSION_LOST",
+                    "浏览器已重启，原页面和登录态已失效，请重新打开网址。",
                 )
-            if len(self._sessions) >= self.max_sessions:
+            if time.monotonic() - session.last_used >= self.idle_timeout:
+                await self._drop(owner, session, save_state=True)
+                raise AgentBrowserError(
+                    "SESSION_EXPIRED", "浏览器会话已空闲过期，请重新打开网址。"
+                )
+            return session
+        if not create:
+            raise AgentBrowserError(
+                "NO_SESSION", "当前没有浏览器会话，请先调用 browser_open。"
+            )
+        async with self._registry_lock:
+            if len(self._sessions) + len(self._creating) >= self.max_sessions:
                 raise AgentBrowserError(
                     "SESSION_LIMIT",
                     "浏览器会话数量已达上限，请关闭不用的会话或稍后重试。",
                 )
-            session = await self._restore_session(owner, browser)
+            self._creating.add(owner)
+        try:
+            session = await self._restore_session(owner, browser, mode=mode)
             self._sessions[owner] = session
             return session
+        finally:
+            self._creating.discard(owner)
 
     async def _restore_session(
-        self, owner: Owner, browser: Browser, options: dict[str, Any] | None = None
+        self,
+        owner: Owner,
+        browser: Browser,
+        options: dict[str, Any] | None = None,
+        *,
+        mode: str = "headless",
     ) -> AgentSession:
         """Load a new session's own snapshot, with a clean fallback on invalid data."""
         saved = None
@@ -296,11 +380,13 @@ class AgentBrowser:
                         type(exc).__name__,
                     )
         try:
-            session = await self._new_session(owner, browser, saved, options)
+            session = await self._new_session(owner, browser, saved, options, mode=mode)
         except PlaywrightError:
             if saved is None:
                 raise
-            session = await self._new_session(owner, browser, options=options)
+            session = await self._new_session(
+                owner, browser, options=options, mode=mode
+            )
             notice = "已保存的登录状态无法载入，本次会话从空白状态开始。"
             logger.warning("Saved browser login state was rejected by Chromium")
         if notice:
@@ -313,6 +399,8 @@ class AgentBrowser:
         browser: Browser,
         storage_state: dict | None = None,
         options: dict[str, Any] | None = None,
+        *,
+        mode: str = "headless",
     ) -> AgentSession:
         options = environment({}) if options is None else options
         context = await browser.new_context(
@@ -322,7 +410,7 @@ class AgentBrowser:
             accept_downloads=True,
             storage_state=storage_state,
         )
-        session = AgentSession(context, owner=owner, environment=options)
+        session = AgentSession(context, owner=owner, environment=options, mode=mode)
         try:
             context.set_default_timeout(self.action_timeout * 1000)
             context.set_default_navigation_timeout(self.action_timeout * 1000)
@@ -336,12 +424,34 @@ class AgentBrowser:
                     lambda request: session.network.finished(request, failed=True),
                 )
             context.on("page", lambda page: self._register_page(session, page))
+            if mode == "headed":
+
+                def context_closed() -> None:
+                    session.context_closed = True
+                    self._schedule_external_close(session)
+
+                def disconnected() -> None:
+                    session.context_closed = True
+                    self._schedule_external_close(session)
+
+                context.on("close", context_closed)
+                session.disconnect_handler = disconnected
+                browser.on("disconnected", disconnected)
+
+                def activity(source: dict[str, Any]) -> None:
+                    if self._sessions.get(owner) is session and not session.closing:
+                        session.last_used = time.monotonic()
+
+                await context.expose_binding("__astrbot_browser_activity", activity)
+                await context.add_init_script(ACTIVITY_SCRIPT)
             if "geolocation" in options:
                 await context.grant_permissions(["geolocation"])
 
             context.on("dialog", lambda dialog: self._handle_dialog(session, dialog))
             return session
         except BaseException:
+            if session.disconnect_handler is not None:
+                browser.remove_listener("disconnected", session.disconnect_handler)
             await context.close()
             raise
 
@@ -452,7 +562,13 @@ class AgentBrowser:
         tab_id = f"tab_{session.next_tab}"
         session.tabs[tab_id] = page
         page.on("download", lambda download: self._start_download(session, download))
-        page.on("close", lambda: session.tabs.pop(tab_id, None))
+
+        def page_closed() -> None:
+            session.tabs.pop(tab_id, None)
+            if session.mode == "headed":
+                self._schedule_external_close(session)
+
+        page.on("close", page_closed)
         if not session.active_tab:
             session.active_tab = tab_id
 
@@ -630,7 +746,8 @@ class AgentBrowser:
             self._tasks.add(task)
         try:
             return await asyncio.wait_for(
-                self._execute(owner, action, arguments), timeout=self.action_timeout
+                self._serialized_execute(owner, action, arguments),
+                timeout=self.action_timeout,
             )
         except asyncio.TimeoutError as exc:
             raise AgentBrowserError(
@@ -657,6 +774,88 @@ class AgentBrowser:
             if task is not None:
                 self._tasks.discard(task)
 
+    async def _serialized_execute(
+        self, owner: Owner, action: str, args: dict[str, Any]
+    ) -> BrowserResult:
+        async with self._owner_lock(owner):
+            if self._closed:
+                raise AgentBrowserError("SERVICE_CLOSED", "Agent 浏览器服务已停止。")
+            result = await self._execute(owner, action, args)
+            session = self._sessions.get(owner)
+            result.data.setdefault(
+                "mode", session.mode if session is not None else "headless"
+            )
+            return result
+
+    async def _mode(self, owner: Owner, target: str) -> BrowserResult:
+        if target not in {"status", "headless", "headed"}:
+            raise AgentBrowserError(
+                "INVALID_ARGUMENT", "mode 为 status/headless/headed。"
+            )
+        previous = self._sessions.get(owner)
+        if previous is not None and (
+            previous.context_closed or not previous.context.browser.is_connected()
+        ):
+            await self._drop(owner, previous)
+            previous = None
+        if target == "status":
+            return BrowserResult(
+                {
+                    "success": True,
+                    "mode": previous.mode if previous else "headless",
+                    "session_active": previous is not None,
+                    "headed_enabled": self.headed_enabled,
+                    "headed_in_use": self._headed_owner is not None,
+                }
+            )
+        if target == "headed" and not self.headed_enabled:
+            raise AgentBrowserError(
+                "HEADED_DISABLED",
+                "有头模式已关闭，请在 browser_use.headed_enabled 中开启并重载插件。",
+            )
+        if previous is not None and previous.mode == target:
+            return BrowserResult(
+                {
+                    "success": True,
+                    "mode": target,
+                    "session_active": True,
+                    "session_rebuilt": False,
+                }
+            )
+        if previous is None and target == "headless":
+            return BrowserResult(
+                {
+                    "success": True,
+                    "mode": "headless",
+                    "session_active": False,
+                    "session_rebuilt": False,
+                }
+            )
+        if target == "headed":
+            async with self._registry_lock:
+                if self._headed_owner is not None and self._headed_owner != owner:
+                    raise AgentBrowserError(
+                        "HEADED_BUSY",
+                        "有头会话正在使用中，请稍后重试或继续使用无头模式。",
+                    )
+                if (
+                    previous is None
+                    and len(self._sessions) + len(self._creating) >= self.max_sessions
+                ):
+                    raise AgentBrowserError("SESSION_LIMIT", "浏览器会话数量已达上限。")
+                self._headed_owner = owner
+        try:
+            async with self.service.operation(target) as browser:
+                return await self._replace_session(owner, browser, mode=target)
+        except BaseException:
+            if target == "headed" and self._sessions.get(owner) is previous:
+                try:
+                    await self.service.close_headed()
+                finally:
+                    if self._headed_owner == owner:
+                        self._headed_owner = None
+            raise
+
     @staticmethod
     def validate_owner(owner: Owner) -> None:
         if (
@@ -677,6 +876,24 @@ class AgentBrowser:
     async def _execute(
         self, owner: Owner, action: str, args: dict[str, Any]
     ) -> BrowserResult:
+        if action == "mode":
+            return await self._mode(owner, args.get("mode", "status"))
+        current = self._sessions.get(owner)
+        mode = current.mode if current is not None else "headless"
+        if (
+            current is not None
+            and mode == "headed"
+            and (current.context_closed or not current.context.browser.is_connected())
+        ):
+            await self._drop(owner, current)
+            raise AgentBrowserError(
+                "SESSION_LOST",
+                "有头窗口已关闭，原会话已失效；重新打开网址默认使用无头模式。",
+            )
+        if action == "close" and current is None:
+            return BrowserResult(
+                {"success": True, "session_closed": True, "state_saved": None}
+            )
         if action == "emulate":
             operation, settings = (
                 args.get("operation", "status"),
@@ -691,7 +908,7 @@ class AgentBrowser:
                 )
             if operation in {"set", "reset"}:
                 options = environment(settings if operation == "set" else {})
-                async with self.service.operation() as browser:
+                async with self.service.operation(mode) as browser:
                     return await self._replace_session(owner, browser, options=options)
         if action == "download":
             return await self._files(owner, args)
@@ -726,7 +943,7 @@ class AgentBrowser:
             if operation == "restore":
                 async with self.storage.lock(owner):
                     saved = self.storage.read_state(owner)
-                async with self.service.operation() as browser:
+                async with self.service.operation(mode) as browser:
                     result = await self._replace_session(owner, browser, saved=saved)
                     result.data["restored"] = True
                     return result
@@ -752,11 +969,21 @@ class AgentBrowser:
                 )
             if type(args.get("new_tab", False)) is not bool:
                 raise AgentBrowserError("INVALID_ARGUMENT", "new_tab 必须是布尔值。")
-        async with self.service.operation() as browser:
+        if current is None and action not in {
+            "open",
+            "network",
+            "intercept",
+            "emulate",
+        }:
+            raise AgentBrowserError(
+                "NO_SESSION", "当前没有浏览器会话，请先调用 browser_open。"
+            )
+        async with self.service.operation(mode) as browser:
             session = await self._get_session(
                 owner,
                 browser,
                 create=action in {"open", "network", "intercept", "emulate"},
+                mode=mode,
             )
             async with session.lock:
                 if self._sessions.get(owner) is not session:
@@ -790,17 +1017,28 @@ class AgentBrowser:
         *,
         saved: dict | None = None,
         options: dict[str, Any] | None = None,
+        mode: str | None = None,
     ) -> BrowserResult:
         """Commit a rebuilt context only after it is usable; retain the old one on failure."""
+        previous = self._sessions.get(owner)
+        mode = mode or (previous.mode if previous else "headless")
         async with self._registry_lock:
-            previous = self._sessions.get(owner)
-            if previous is None and len(self._sessions) >= self.max_sessions:
+            if (
+                previous is None
+                and len(self._sessions) + len(self._creating) >= self.max_sessions
+            ):
                 raise AgentBrowserError("SESSION_LIMIT", "浏览器会话数量已达上限。")
+            if previous is None:
+                self._creating.add(owner)
+        try:
             async with previous.lock if previous else asyncio.Lock():
                 preserve_auto_save = saved is None
                 if previous is not None:
                     if saved is None:
-                        if previous.context.browser is not browser:
+                        if (
+                            previous.mode == mode
+                            and previous.context.browser is not browser
+                        ):
                             raise AgentBrowserError(
                                 "SESSION_LOST",
                                 "浏览器已重启，不能保留原会话；请重新打开网站。",
@@ -809,9 +1047,13 @@ class AgentBrowser:
                     if options is None:
                         options = previous.environment
                 if previous is None and saved is None:
-                    session = await self._restore_session(owner, browser, options)
+                    session = await self._restore_session(
+                        owner, browser, options, mode=mode
+                    )
                 else:
-                    session = await self._new_session(owner, browser, saved, options)
+                    session = await self._new_session(
+                        owner, browser, saved, options, mode=mode
+                    )
                 try:
                     await session.context.new_page()
                     if previous is not None:
@@ -820,19 +1062,25 @@ class AgentBrowser:
                         session.interceptor.rules = dict(previous.interceptor.rules)
                         session.network.active = previous.network.active
                         session.network.pattern = previous.network.pattern
-                        await self._drop(owner, previous)
-                    self._sessions[owner] = session
                 except BaseException:
-                    await session.context.close()
+                    await self._drop(owner, session, release_headed=False)
                     raise
+                self._sessions[owner] = session
+                if previous is not None:
+                    await self._drop(
+                        owner, previous, release_headed=previous.mode != mode
+                    )
                 return BrowserResult(
                     {
                         "success": True,
+                        "mode": mode,
                         "environment": session.environment,
                         "session_rebuilt": True,
                         "message": "会话已重建，登录存储已载入；旧标签页和元素编号已失效，请调用 browser_open 打开网站。网络记录与弹窗规则已清空。",
                     }
                 )
+        finally:
+            self._creating.discard(owner)
 
     async def _files(self, owner: Owner, args: dict[str, Any]) -> BrowserResult:
         operation, file_id = args.get("operation", "list"), args.get("file_id", "")
@@ -1270,7 +1518,12 @@ class AgentBrowser:
         if action == "close":
             saved = await self._drop(owner, session, save_state=True)
             return BrowserResult(
-                {"success": True, "session_closed": True, "state_saved": saved}
+                {
+                    "success": True,
+                    "session_closed": True,
+                    "state_saved": saved,
+                    "mode": session.mode,
+                }
             )
         if action == "tabs":
             operation = args.get("operation", "list")

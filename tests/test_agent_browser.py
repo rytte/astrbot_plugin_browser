@@ -2,7 +2,10 @@
 
 import asyncio
 import json
+import os
 import struct
+import sys
+import time
 from contextlib import suppress
 from pathlib import Path
 from types import SimpleNamespace
@@ -20,6 +23,7 @@ from astrbot_plugin_browser.service import (
     BrowserServiceError,
     find_system_chromium,
 )
+from playwright.async_api import Error as PlaywrightError
 from playwright.async_api import async_playwright
 
 OWNER = ("test:group:one", "alice")
@@ -602,7 +606,7 @@ async def test_explicit_login_state_save_and_restore_preserves_storage(
     assert not (await agent.execute(OWNER, "state")).data["saved"]
     assert not list(agent.storage.root().rglob("*.json"))
     saved = await agent.execute(OWNER, "state", operation="save")
-    assert saved.data == {"success": True, "saved": True}
+    assert saved.data == {"success": True, "saved": True, "mode": "headless"}
     assert not (await agent.execute(OTHER, "state")).data["saved"]
     with pytest.raises(AgentBrowserError) as error:
         await agent.execute(OTHER, "state", operation="restore")
@@ -1667,3 +1671,293 @@ async def test_advanced_scaled_mobile_page_uses_elements_instead_of_mismatched_c
         ref=element(result, "搜索"),
     )
     assert "搜索结果" in text(result)
+
+
+@pytest.fixture
+async def mode_agent(browser_agent, monkeypatch):
+    """Exercise two real Browser processes without requiring a desktop in CI."""
+    chromium = browser_agent.service._playwright.chromium
+    launch = chromium.launch
+
+    async def launch_without_window(**kwargs):
+        return await launch(**{**kwargs, "headless": True})
+
+    monkeypatch.setattr(chromium, "launch", launch_without_window)
+    return browser_agent
+
+
+async def test_mode_status_disabled_and_invalid_do_not_start_browser(tmp_path):
+    agent = AgentBrowser(BrowserService(), data_dir=tmp_path, headed_enabled=False)
+    try:
+        assert not (await agent.execute(OWNER, "mode")).data["session_active"]
+        assert not (await agent.execute(OWNER, "mode", mode="headless")).data[
+            "session_active"
+        ]
+        for value, code in [
+            ("headed", "HEADED_DISABLED"),
+            ("invalid", "INVALID_ARGUMENT"),
+        ]:
+            with pytest.raises(AgentBrowserError) as error:
+                await agent.execute(OWNER, "mode", mode=value)
+            assert error.value.code == code
+        await agent.execute(OWNER, "close")
+        assert agent.service._playwright is None
+    finally:
+        await agent.close()
+
+
+async def test_mode_switch_preserves_login_environment_and_never_writes_state(
+    mode_agent, site
+):
+    agent = mode_agent
+    await agent.execute(OWNER, "open", url=site[0])
+    previous = agent._sessions[OWNER]
+    previous_page = previous.tabs["tab_1"]
+    await previous.context.add_cookies(
+        [{"name": "login", "value": "alice", "url": site[0]}]
+    )
+    await previous.tabs["tab_1"].evaluate("localStorage.setItem('account','alice')")
+    await agent.execute(OWNER, "state", operation="clear")
+    await agent.execute(OWNER, "mode", mode="headed")
+    headed = agent.service._headed_browser
+    assert headed is not agent.service._browser
+    assert previous_page.is_closed()
+    assert agent._sessions[OWNER].mode == "headed"
+    assert not agent._sessions[OWNER].auto_save
+    assert (await agent.execute(OWNER, "open", url=site[0])).data["mode"] == "headed"
+    page = agent._sessions[OWNER].tabs["tab_1"]
+    assert await page.evaluate("localStorage.getItem('account')") == "alice"
+    assert (await agent._sessions[OWNER].context.cookies())[0]["value"] == "alice"
+    await agent.execute(OWNER, "emulate", operation="set", settings={"locale": "zh-CN"})
+    assert agent._sessions[OWNER].mode == "headed"
+    assert agent.service._headed_browser is headed
+    await agent.execute(OWNER, "mode", mode="headless")
+    assert agent._sessions[OWNER].environment["locale"] == "zh-CN"
+    assert not agent._sessions[OWNER].auto_save
+    assert agent.service._headed_browser is None and not headed.is_connected()
+    assert agent._headed_owner is None
+    assert not agent.storage.state_path(OWNER).is_file()
+    assert agent.service.ready
+
+
+async def test_headed_exclusivity_idempotence_and_headless_users(mode_agent, site):
+    agent = mode_agent
+    await agent.execute(OWNER, "mode", mode="headed")
+    first = agent._sessions[OWNER]
+    assert not (await agent.execute(OWNER, "mode", mode="headed")).data[
+        "session_rebuilt"
+    ]
+    assert agent._sessions[OWNER] is first
+    with pytest.raises(AgentBrowserError) as error:
+        await agent.execute(OTHER, "mode", mode="headed")
+    assert error.value.code == "HEADED_BUSY"
+    assert (await agent.execute(OTHER, "open", url=site[0])).data["mode"] == "headless"
+    assert (await agent.service.render_html("<html>offline</html>")).startswith(
+        b"\x89PNG"
+    )
+    assert (await agent.execute(OWNER, "close")).data["state_saved"] is True
+    assert agent.service._headed_browser is None
+    await agent.execute(OTHER, "mode", mode="headed")
+    assert agent._headed_owner == OTHER
+
+
+@pytest.mark.parametrize("end", ["close", "last_tab", "idle", "shutdown"])
+async def test_headed_end_saves_once_and_releases_browser(
+    mode_agent, site, monkeypatch, end
+):
+    agent = mode_agent
+    await agent.execute(OWNER, "mode", mode="headed")
+    await agent.execute(OWNER, "open", url=site[0])
+    session = agent._sessions[OWNER]
+    headed = agent.service._headed_browser
+    await session.tabs["tab_1"].evaluate("localStorage.setItem('account','headed')")
+    write = agent.storage.write_state
+    writes = []
+
+    def record(owner, state):
+        writes.append(owner)
+        return write(owner, state)
+
+    monkeypatch.setattr(agent.storage, "write_state", record)
+    if end == "close":
+        await agent.execute(OWNER, "close")
+    elif end == "last_tab":
+        await agent.execute(OWNER, "tabs", operation="close", tab_id="tab_1")
+    elif end == "idle":
+        session.last_used = 0
+        await agent.reap_idle()
+    else:
+        await agent.close()
+    assert writes == [OWNER]
+    assert agent._headed_owner is None and agent.service._headed_browser is None
+    assert not headed.is_connected() and agent.service.ready
+    assert OWNER not in agent._sessions
+    if end != "shutdown":
+        assert (await agent.execute(OWNER, "open", url=site[0])).data[
+            "mode"
+        ] == "headless"
+        assert (
+            await agent._sessions[OWNER]
+            .tabs["tab_1"]
+            .evaluate("localStorage.getItem('account')")
+            == "headed"
+        )
+
+
+async def test_headed_restore_and_clear_stay_in_current_mode(mode_agent, site):
+    agent = mode_agent
+    await agent.execute(OWNER, "mode", mode="headed")
+    await agent.execute(OWNER, "open", url=site[0])
+    await agent.execute(OWNER, "state", operation="save")
+    headed = agent.service._headed_browser
+    await agent.execute(OWNER, "state", operation="restore")
+    assert agent._sessions[OWNER].mode == "headed"
+    assert agent.service._headed_browser is headed
+    await agent.execute(OWNER, "state", operation="clear")
+    assert (await agent.execute(OWNER, "close")).data["state_saved"] is None
+    assert not agent.storage.state_path(OWNER).is_file()
+
+
+@pytest.mark.parametrize("failure", ["launch", "context", "cancel"])
+async def test_failed_mode_switch_retains_original_session(
+    mode_agent, site, monkeypatch, failure
+):
+    agent = mode_agent
+    await agent.execute(OWNER, "open", url=site[0])
+    previous = agent._sessions[OWNER]
+    if failure == "launch":
+        monkeypatch.setattr(
+            agent.service._playwright.chromium,
+            "launch",
+            AsyncMock(side_effect=PlaywrightError("no display")),
+        )
+    else:
+        monkeypatch.setattr(
+            agent,
+            "_new_session",
+            AsyncMock(
+                side_effect=asyncio.CancelledError()
+                if failure == "cancel"
+                else PlaywrightError("new context failed")
+            ),
+        )
+    with pytest.raises(
+        asyncio.CancelledError if failure == "cancel" else AgentBrowserError
+    ):
+        await agent.execute(OWNER, "mode", mode="headed")
+    assert agent._sessions[OWNER] is previous
+    assert not previous.tabs["tab_1"].is_closed()
+    assert agent.service.ready and agent.service._headed_browser is None
+    assert agent._headed_owner is None
+    assert not agent.storage.state_path(OWNER).is_file()
+
+
+async def test_switch_serializes_owner_but_keeps_other_users_running(
+    mode_agent, site, monkeypatch
+):
+    agent = mode_agent
+    await agent.execute(OWNER, "open", url=site[0])
+    launch = agent.service._playwright.chromium.launch
+    started, release = asyncio.Event(), asyncio.Event()
+
+    async def delayed_launch(**kwargs):
+        started.set()
+        await release.wait()
+        return await launch(**kwargs)
+
+    monkeypatch.setattr(agent.service._playwright.chromium, "launch", delayed_launch)
+    switch = asyncio.create_task(agent.execute(OWNER, "mode", mode="headed"))
+    observe = None
+    try:
+        await asyncio.wait_for(started.wait(), timeout=3)
+        observe = asyncio.create_task(agent.execute(OWNER, "observe"))
+        assert (
+            await asyncio.wait_for(agent.execute(OTHER, "open", url=site[0]), timeout=3)
+        ).data["mode"] == "headless"
+        assert not observe.done()
+    finally:
+        release.set()
+        await switch
+        if observe is not None:
+            assert (await observe).data["mode"] == "headed"
+
+
+async def test_headed_manual_activity_refreshes_idle_timer(mode_agent, site):
+    agent = mode_agent
+    await agent.execute(OWNER, "mode", mode="headed")
+    await agent.execute(OWNER, "open", url=site[0])
+    session = agent._sessions[OWNER]
+    page = session.tabs["tab_1"]
+    activity = asyncio.Event()
+    await page.expose_function("__test_activity_received", activity.set)
+    await page.evaluate("""() => {
+        const original = window.__astrbot_browser_activity;
+        window.__astrbot_browser_activity = async () => {
+            await original();
+            await window.__test_activity_received();
+        };
+    }""")
+    session.last_used = 0
+    await page.mouse.click(20, 20)
+    await asyncio.wait_for(activity.wait(), timeout=2)
+    assert time.monotonic() - session.last_used < 2
+    await agent.reap_idle()
+    assert agent._sessions[OWNER] is session
+    assert not agent.storage.state_path(OWNER).is_file()
+
+
+@pytest.mark.parametrize("external", ["page", "context", "browser"])
+async def test_external_headed_close_releases_slot_without_reopening(
+    mode_agent, site, external
+):
+    agent = mode_agent
+    await agent.execute(OWNER, "mode", mode="headed")
+    await agent.execute(OWNER, "open", url=site[0])
+    previous = agent._sessions[OWNER]
+    if external == "page":
+        await previous.tabs["tab_1"].close()
+    elif external == "context":
+        await previous.context.close()
+    else:
+        await agent.service._headed_browser.close()
+    if agent._maintenance:
+        await asyncio.gather(*list(agent._maintenance))
+    assert OWNER not in agent._sessions
+    assert agent._headed_owner is None and agent.service._headed_browser is None
+    assert agent.service.ready
+    with pytest.raises(AgentBrowserError) as error:
+        await agent.execute(OWNER, "observe")
+    assert error.value.code == "NO_SESSION"
+    assert agent.service._headed_browser is None
+    await agent.execute(OTHER, "mode", mode="headed")
+    await agent._external_close(previous)
+    assert agent._sessions[OTHER].mode == "headed"
+
+
+@pytest.mark.skipif(
+    sys.platform.startswith("linux") and not os.environ.get("DISPLAY"),
+    reason="A graphical desktop is required",
+)
+async def test_real_headed_window_runs_existing_tools_and_preserves_renderer(
+    browser_agent, site
+):
+    agent = browser_agent
+    await agent.execute(OWNER, "mode", mode="headed")
+    opened = await agent.execute(OWNER, "open", url=site[0])
+    filled = await agent.execute(
+        OWNER,
+        "fill",
+        observation_id=opened.data["observation_id"],
+        ref=element(opened, "搜索商品"),
+        text="有头浏览",
+    )
+    result = await agent.execute(
+        OWNER, "press", observation_id=filled.data["observation_id"], key="Enter"
+    )
+    assert result.data["mode"] == "headed" and "回车：有头浏览" in text(result)
+    assert (await agent.execute(OWNER, "screenshot")).image.startswith(b"\x89PNG")
+    assert (await agent.service.render_html("<html>still offline</html>")).startswith(
+        b"\x89PNG"
+    )
+    await agent.execute(OWNER, "close")
+    assert agent.service._headed_browser is None and agent.service.ready

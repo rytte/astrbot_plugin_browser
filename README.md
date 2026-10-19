@@ -2,7 +2,7 @@
 
 让 AstrBot 的 Agent 通过模型工具操作真实网页：观察与截图、鼠标和表单操作、文件上传下载、结构化提取、弹窗处理、登录状态保存和多标签页。插件也为其他 AstrBot 插件提供 HTML 截图和 PDF 渲染服务，两类任务共用一个 Chromium 进程。
 
-它启动的是**无头 Chromium**，不会弹出浏览器窗口。Agent 会话按“消息来源＋发送者”隔离，并跨多轮工具调用保留页面和登录状态；离线渲染任务使用临时 BrowserContext，结束后释放。
+默认启动常驻的**无头 Chromium**，不显示窗口；只有明确请求时才额外启动有头浏览器，最多一个实例和一个有头会话，用完释放。Agent 会话按“消息来源＋发送者”隔离，并跨多轮工具调用保留页面和登录状态；离线渲染始终使用无头实例中的临时 BrowserContext，结束后释放。
 
 ## 🤖 Agent 如何使用
 
@@ -14,14 +14,15 @@ Agent 使用 AstrBot 自身的工具调用循环决定下一步，插件负责�
 
 | 配置值 | 层级 | 工具总数 | 适用任务 |
 |---|---|---:|---|
-| `basic`（默认） | 第一层：基础浏览 | 12 | 搜索、阅读、表单填写、菜单和标签页操作 |
-| `standard` | 第二层：完整交互 | 18 | 增加拖拽、文件上传下载、结构化提取、弹窗和登录状态管理 |
-| `full` | 第三层：高级控制 | 22 | 增加网络监听、请求拦截、设备环境模拟和主动执行 JavaScript |
+| `basic`（默认） | 第一层：基础浏览 | 13 | 搜索、阅读、表单填写、菜单、标签页和浏览器模式切换 |
+| `standard` | 第二层：完整交互 | 19 | 增加拖拽、文件上传下载、结构化提取、弹窗和登录状态管理 |
+| `full` | 第三层：高级控制 | 23 | 增加网络监听、请求拦截、设备环境模拟和主动执行 JavaScript |
 
 ### 第一层：基础浏览
 
 | 工具 | 用途 |
 |---|---|
+| `browser_mode(mode="status")` | 查询模式；明确请求时切换 `headed` / `headless`，不额外保存磁盘快照 |
 | `browser_open(url, new_tab=False)` | 打开完整 HTTP/HTTPS 网址；首次调用创建个人会话 |
 | `browser_observe()` | 返回网址、标题、文字、元素清单及新的 `observation_id` |
 | `browser_screenshot()` | 将当前视口 PNG 和页面观察返回给支持视觉的模型 |
@@ -37,7 +38,7 @@ Agent 使用 AstrBot 自身的工具调用循环决定下一步，插件负责�
 
 ### 第二层：完整交互
 
-设置 `browser_use.tool_level="standard"`，在基础浏览的 12 个工具上增加以下 6 个：
+设置 `browser_use.tool_level="standard"`，在基础浏览的 13 个工具上增加以下 6 个：
 
 | 工具 | 用途 |
 |---|---|
@@ -50,7 +51,7 @@ Agent 使用 AstrBot 自身的工具调用循环决定下一步，插件负责�
 
 ### 第三层：高级控制
 
-设置 `browser_use.tool_level="full"`，在完整交互的 18 个工具上增加以下 4 个：
+设置 `browser_use.tool_level="full"`，在完整交互的 19 个工具上增加以下 4 个：
 
 | 工具 | 用途 |
 |---|---|
@@ -102,11 +103,34 @@ Agent 使用 AstrBot 自身的工具调用循环决定下一步，插件负责�
 - 每个会话最多 8 个标签页。网页弹出的标签页会出现在列表中，由模型明确切换。
 - 会话正常结束前自动保存登录快照，创建新会话时按用户自动恢复；适用于全部工具层级。浏览操作期间不定时保存，也不会每次操作都写盘，仍可通过 `browser_state(operation="save")` 提前保存。
 - Agent 页面启用 JavaScript 并允许 HTTP/HTTPS 请求；网络访问使用 AstrBot 所在主机的网络环境。
-- JavaScript 弹窗按一次性预设规则处理，无匹配规则时自动取消；结果包含 `dialogs` 历史和 `notices`。人工登录接管暂未提供。
+- JavaScript 弹窗按一次性预设规则处理，无匹配规则时自动取消；结果包含 `dialogs` 历史和 `notices`。
 - 失败结果包含 `success=false` 及 `error.code`、`error.message`。元素失效时重新观察；工具超时后操作可能已执行，应先观察确认，避免重复提交。
 - 浏览器重启会返回 `SESSION_LOST`；原会话不自动重放，模型需要重新打开网站。
 
 模型工具在 AstrBot 进程内运行。网页文字作为任务资料使用，任务目标来自用户。
+
+### 按需有头浏览和人工操作
+
+默认会话使用无头实例，只有用户明确需要可见窗口时才调用 `browser_mode(mode="headed")`。窗口显示在 **AstrBot 所在主机的图形桌面**，需要可用的桌面环境；使用普通 Context，不通过 CDP 接管用户已有的 Chrome。
+
+```python
+browser_mode(mode="status")     # 查询，不启动浏览器
+browser_mode(mode="headed")     # 按需启动窗口，或者把个人会话交接到有头实例
+browser_open(url="https://example.com")
+# 人工登录或操作完成后，先确认标签页，再重新观察
+browser_tabs(operation="list")
+browser_observe()
+browser_mode(mode="headless")   # 可选：在内存中交接回无头，随后需重新打开网址
+# 或 browser_close()：保存登录快照并结束会话
+```
+
+最多一个有头 Browser 和一个活动有头会话。重复请求自己的当前模式不会重建会话；被其他用户占用时返回 `HEADED_BUSY`，不抢占、不长期排队。无头会话、渲染与有头工具操作共享原有执行并发名额，人工等待不占执行名额；有头与无头会话合计受 `max_sessions` 限制。
+
+同一用户同时只有一个活动会话。模式切换时先创建目标 Context，成功后再释放旧 Context；启动或导入失败时保留原会话。Cookie、Local Storage、IndexedDB、环境设置、拦截规则和监听开关随会话交接；页面、sessionStorage、观察编号、网络历史和弹窗规则不保留，之后需 `browser_open`。切换只在内存传递状态，不写登录快照；`clear` 停用自动保存的标志也会延续。现有点击、输入、截图、文件等工具继续操作当前模式，返回结果包含 `mode`。
+
+主动关闭、工具关闭最后一个标签页或空闲回收时，先保存，再关闭有头 Context 和 Browser，保留无头实例及共享 Playwright；插件正常停止时则先完成会话保存，再关闭两种浏览器和运行时。下一次普通 `browser_open` 默认回到无头模式。人工点击、输入和滚动会节流更新空闲时间；后台请求和自动刷新不续期，模式查询也不续期。人工操作不与模型操作自动互斥，接手前应确认目标标签页并重新观察。
+
+手动关窗会尽力保存仍可访问的 Context，并释放占用名额；若 Context 已销毁或浏览器崩溃，则保留旧磁盘快照，无法保证保存最后状态。后续观察不会自动重开有头窗口。有头启动失败或退出不停止无头渲染服务。`browser_use.headed_enabled=false` 可关闭有头入口。
 
 ### 上传与下载
 
@@ -226,7 +250,7 @@ browser_evaluate(
 
 浏览器是比较占资源的组件。如果 Markdown 渲染、网页卡片、报告导出等插件各自启动一套 Chromium，很快就会出现多个浏览器进程、重复的 Playwright 驱动和重复的缓存。
 
-本插件只维护一个共享的 Chromium 进程：
+默认只维护一个共享的无头 Chromium 实例；额外的有头实例仅在明确请求后存在：
 
 ```text
 AstrBot
@@ -470,7 +494,8 @@ async with browser.session(
 | 配置项 | 默认值 | 范围 | 说明 |
 |---|---:|---:|---|
 | `browser_use.enabled` | `true` | 布尔值 | 是否向模型提供 BrowserUse 工具 |
-| `browser_use.tool_level` | `basic` | `basic` / `standard` / `full` | 基础浏览 12 个、完整交互 18 个、高级控制 22 个工具，高层包含低层全部工具 |
+| `browser_use.tool_level` | `basic` | `basic` / `standard` / `full` | 基础浏览 13 个、完整交互 19 个、高级控制 23 个工具，高层包含低层全部工具 |
+| `browser_use.headed_enabled` | `true` | 布尔值 | 允许明确请求时启动有头窗口；最多一个有头实例及会话 |
 | `browser_use.max_sessions` | `4` | 1～16 | 同时保留的 Agent 联网会话上限，与执行并发分别限制 |
 | `browser_use.idle_timeout` | `600` 秒 | 30～3600 | Agent 会话空闲回收时间 |
 | `browser_use.action_timeout` | `30` 秒 | 1～120 | 单次 Agent 工具总时限，包括排队、操作和观察 |
@@ -481,7 +506,7 @@ async with browser.session(
 
 原顶层浏览器路径、并发、排队和启动超时配置已移入 `browser` 组；原顶层 `max_agent_sessions`、`agent_idle_timeout`、`agent_action_timeout` 已移入 `browser_use` 组并更名。手动配置请使用表中的新路径，不提供旧字段别名；若将旧字段直接传入插件，会报未知配置错误。AstrBot 配置加载器可能按新 schema 清理旧字段并补入默认值，升级前请记录旧值，再在新组中重新设置。
 
-浏览器固定以无头模式启动。配置 `browser.browser_executable` 只会改变使用的浏览器程序，不会让它弹出窗口。显式配置的路径始终优先，路径无效或启动失败时不会自动切换。
+浏览器默认以无头模式启动；有头模式只能通过 `browser_mode(mode="headed")` 明确请求。配置 `browser.browser_executable` 只改变使用的浏览器程序，两种模式使用同一程序。显式配置的路径始终优先，路径无效或启动失败时不会自动切换。
 
 ## 🛡️ 默认边界和限制
 

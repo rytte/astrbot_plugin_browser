@@ -6,6 +6,7 @@ from .service import BrowserServiceError
 
 BASIC_ACTIONS = frozenset(
     {
+        "mode",
         "open",
         "close",
         "observe",
