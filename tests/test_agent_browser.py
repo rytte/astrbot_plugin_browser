@@ -13,6 +13,7 @@ from unittest.mock import AsyncMock
 from urllib.parse import urlsplit
 
 import pytest
+from astrbot_plugin_browser import service as service_module
 from astrbot_plugin_browser.agent_browser import (
     AgentBrowser,
     AgentBrowserError,
@@ -198,6 +199,51 @@ async def browser_agent(tmp_path, request):
 async def mouse_page(browser_agent, site):
     await browser_agent.execute(OWNER, "open", url=site[0] + "/mouse")
     return browser_agent._sessions[OWNER].tabs["tab_1"]
+
+
+async def test_idle_shutdown_protects_agent_context_and_restores_login_after_render_wake(
+    browser_agent, site, monkeypatch
+):
+    agent = browser_agent
+    service = agent.service
+    service.idle_shutdown_enabled = True
+    clock = SimpleNamespace(now=1000.0)
+    monkeypatch.setattr(
+        service_module, "time", SimpleNamespace(monotonic=lambda: clock.now)
+    )
+    await agent.execute(OWNER, "open", url=site[0])
+    original_browser = service._browser
+    context = agent._sessions[OWNER].context
+    await context.add_cookies([{"name": "login", "value": "saved", "url": site[0]}])
+    export = AsyncMock(wraps=context.storage_state)
+    monkeypatch.setattr(context, "storage_state", export)
+
+    clock.now += 5000
+    await service._close_if_idle()
+    assert service._browser is original_browser
+    png = await service.render_html("<html><body>共享渲染</body></html>")
+    assert png.startswith(b"\x89PNG\r\n\x1a\n")
+    export.assert_not_awaited()
+    assert service._browser is original_browser
+
+    await agent.execute(OWNER, "close")
+    export.assert_awaited_once()
+    clock.now += 1199
+    await service._close_if_idle()
+    assert service._browser is original_browser
+    clock.now += 1
+    await service._close_if_idle()
+    assert service._browser is None and service.ready
+    assert not original_browser.is_connected()
+
+    pdf = await service.render_pdf("<html><body>自动唤醒</body></html>")
+    assert pdf.startswith(b"%PDF-")
+    assert service._browser is not original_browser
+    await agent.execute(OWNER, "open", url=site[0])
+    cookies = await agent._sessions[OWNER].context.cookies()
+    assert any(
+        cookie["name"] == "login" and cookie["value"] == "saved" for cookie in cookies
+    )
 
 
 def element(result, name):

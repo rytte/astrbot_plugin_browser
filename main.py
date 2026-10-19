@@ -38,6 +38,8 @@ class BrowserPlugin(Star):
             "max_concurrent_sessions",
             "queue_timeout",
             "startup_timeout",
+            "idle_shutdown_enabled",
+            "idle_shutdown_timeout",
         }
         if unknown:
             raise BrowserServiceError(
@@ -54,6 +56,7 @@ class BrowserPlugin(Star):
             "idle_timeout",
             "action_timeout",
             "headed_enabled",
+            "user_whitelist",
         }
         if unknown:
             raise BrowserServiceError(
@@ -63,11 +66,22 @@ class BrowserPlugin(Star):
         self.browser_use_enabled = browser_use.get("enabled", True)
         if type(self.browser_use_enabled) is not bool:
             raise BrowserServiceError("browser_use.enabled 必须是布尔值。")
+        user_whitelist = browser_use.get("user_whitelist", [])
+        if not isinstance(user_whitelist, list) or any(
+            not isinstance(user_id, str) or not user_id.strip()
+            for user_id in user_whitelist
+        ):
+            raise BrowserServiceError(
+                "browser_use.user_whitelist 必须是非空个人用户 ID 组成的字符串列表。"
+            )
+        self.user_whitelist = frozenset(user_id.strip() for user_id in user_whitelist)
         self.service = BrowserService(
             browser_executable=browser.get("browser_executable", ""),
             max_concurrent_sessions=browser.get("max_concurrent_sessions", 4),
             queue_timeout=browser.get("queue_timeout", 30),
             startup_timeout=browser.get("startup_timeout", 30),
+            idle_shutdown_enabled=browser.get("idle_shutdown_enabled", False),
+            idle_shutdown_timeout=browser.get("idle_shutdown_timeout", 1200),
         )
         self.agent = AgentBrowser(
             self.service,
@@ -116,6 +130,7 @@ class BrowserPlugin(Star):
                     "BROWSER_USE_DISABLED",
                     "BrowserUse 已关闭。请在插件的 BrowserUse 配置组中开启并重载插件。",
                 )
+            self._require_access(event)
             self.agent.require_action(action)
             owner = (event.unified_msg_origin, event.get_sender_id())
             self.agent.validate_owner(owner)
@@ -208,6 +223,17 @@ class BrowserPlugin(Star):
                     ),
                 )
             ],
+        )
+
+    def _require_access(self, event: AstrMessageEvent) -> None:
+        """Authorize the sender on every call, independently of the chat origin."""
+        is_admin = getattr(event, "is_admin", None)
+        if callable(is_admin) and is_admin() is True:
+            return
+        if event.get_sender_id() in self.user_whitelist:
+            return
+        raise AgentBrowserError(
+            "PERMISSION_DENIED", "仅 AstrBot 管理员或个人白名单用户可使用浏览器工具。"
         )
 
     async def _import_attachments(

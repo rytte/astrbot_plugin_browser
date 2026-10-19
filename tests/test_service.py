@@ -33,25 +33,46 @@ class FakePage:
 
 
 class FakeContext:
-    def __init__(self):
+    def __init__(self, browser):
+        self.browser = browser
+        self.closed = False
+        self._close_handlers = []
         self.page = FakePage()
         self.route = AsyncMock()
         self.new_page = AsyncMock(return_value=self.page)
-        self.close = AsyncMock()
+        self.close = AsyncMock(side_effect=self._close)
+
+    def on(self, event, handler):
+        if event == "close":
+            self._close_handlers.append(handler)
+
+    async def _close(self):
+        self.closed = True
+        for handler in self._close_handlers:
+            handler()
 
 
 class FakeBrowser:
     def __init__(self):
         self.contexts_created = []
-        self.close = AsyncMock()
+        self.close = AsyncMock(side_effect=self._close)
         self._connected = True
         self.new_context = AsyncMock(side_effect=self._new_context)
 
     def is_connected(self):
         return self._connected
 
+    @property
+    def contexts(self):
+        return [context for context, _ in self.contexts_created if not context.closed]
+
+    async def _close(self):
+        self._connected = False
+        for context in self.contexts:
+            await context.close()
+
     async def _new_context(self, **kwargs):
-        context = FakeContext()
+        context = FakeContext(self)
         self.contexts_created.append((context, kwargs))
         return context
 
@@ -75,6 +96,15 @@ def fake_runtime(monkeypatch):
         manager=manager,
         factory=factory,
     )
+
+
+@pytest.fixture
+def service_clock(monkeypatch):
+    clock = SimpleNamespace(now=1000.0)
+    monkeypatch.setattr(
+        service_module, "time", SimpleNamespace(monotonic=lambda: clock.now)
+    )
+    return clock
 
 
 def test_find_system_chromium_uses_path(monkeypatch, tmp_path):
@@ -375,6 +405,319 @@ async def test_stale_headed_close_does_not_close_replacement(fake_runtime):
     assert service._headed_browser is second
     second.close.assert_not_awaited()
     await service.close()
+
+
+async def test_idle_shutdown_is_disabled_by_default(fake_runtime, service_clock):
+    service = BrowserService()
+    await service.initialize()
+    service_clock.now += 86400
+    await service._close_if_idle()
+    fake_runtime.browser.close.assert_not_awaited()
+    assert service._idle_reaper is None
+    await service.close()
+
+
+async def test_idle_shutdown_preserves_readiness_and_wakes_renderers(
+    fake_runtime, service_clock
+):
+    service = BrowserService(idle_shutdown_enabled=True)
+    assert not service.ready
+    await service.initialize()
+    service_clock.now += 1199
+    await service._close_if_idle()
+    fake_runtime.browser.close.assert_not_awaited()
+    service_clock.now += 1
+    await service._close_if_idle()
+    await service._close_if_idle()
+    fake_runtime.browser.close.assert_awaited_once()
+    assert service._browser is None and service.ready
+    fake_runtime.playwright.stop.assert_not_awaited()
+
+    replacement = FakeBrowser()
+    fake_runtime.playwright.chromium.launch.return_value = replacement
+    png, pdf = await asyncio.gather(
+        service.render_html("<html>PNG</html>"),
+        service.render_pdf("<html>PDF</html>"),
+    )
+    async with service.session() as page:
+        assert page is replacement.contexts_created[-1][0].page
+    assert png == b"page-png" and pdf == b"document-pdf"
+    assert service._browser is replacement and service.ready
+    assert fake_runtime.playwright.chromium.launch.await_count == 2
+    assert len(replacement.contexts_created) == 3
+    assert not replacement.contexts
+    reaper = service._idle_reaper
+    await service.close()
+    assert reaper.done() and not service.ready
+    replacement.close.assert_awaited_once()
+    fake_runtime.playwright.stop.assert_awaited_once()
+
+
+async def test_idle_shutdown_waits_for_active_render_and_resets_deadline(
+    fake_runtime, service_clock
+):
+    service = BrowserService(idle_shutdown_enabled=True)
+    await service.initialize()
+    context = await fake_runtime.browser.new_context()
+    started, release = asyncio.Event(), asyncio.Event()
+
+    async def set_content(*args, **kwargs):
+        started.set()
+        await release.wait()
+
+    context.page.set_content.side_effect = set_content
+    fake_runtime.browser.new_context.return_value = context
+    fake_runtime.browser.new_context.side_effect = None
+    task = asyncio.create_task(service.render_html("<html>rendering</html>"))
+    try:
+        await asyncio.wait_for(started.wait(), timeout=2)
+        service_clock.now += 2000
+        await service._close_if_idle()
+        fake_runtime.browser.close.assert_not_awaited()
+        release.set()
+        assert await task == b"page-png"
+        service_clock.now += 1199
+        await service._close_if_idle()
+        fake_runtime.browser.close.assert_not_awaited()
+        service_clock.now += 1
+        await service._close_if_idle()
+        fake_runtime.browser.close.assert_awaited_once()
+    finally:
+        release.set()
+        await asyncio.gather(task, return_exceptions=True)
+        await service.close()
+
+
+async def test_queued_render_prevents_idle_shutdown_and_cancellation_releases_it(
+    fake_runtime, service_clock
+):
+    fake_runtime.playwright.chromium.launch.side_effect = [
+        fake_runtime.browser,
+        FakeBrowser(),
+    ]
+    service = BrowserService(idle_shutdown_enabled=True, max_concurrent_sessions=1)
+    await service.initialize()
+    try:
+        async with service.operation("headed"):
+            task = asyncio.create_task(service.render_pdf("<html>queued</html>"))
+            await asyncio.sleep(0)
+            assert service._headless_operations == 1
+            service_clock.now += 2000
+            await service._close_if_idle()
+            fake_runtime.browser.close.assert_not_awaited()
+            task.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await task
+            assert service._headless_operations == 0
+            service_clock.now += 1200
+            await service._close_if_idle()
+            assert service._browser is None
+    finally:
+        await service.close()
+
+
+async def test_retained_context_starts_idle_timer_only_when_closed(
+    fake_runtime, service_clock
+):
+    service = BrowserService(idle_shutdown_enabled=True)
+    await service.initialize()
+    async with service.operation() as browser:
+        context = await browser.new_context()
+        service.track_context(context)
+    service_clock.now += 5000
+    await service._close_if_idle()
+    fake_runtime.browser.close.assert_not_awaited()
+    # No collector runs between the last busy check and this context's close.
+    service_clock.now += 500
+    await context.close()
+    service_clock.now += 1199
+    await service._close_if_idle()
+    fake_runtime.browser.close.assert_not_awaited()
+    service_clock.now += 1
+    await service._close_if_idle()
+    assert service._browser is None and service.ready
+    await service.close()
+
+
+async def test_idle_headless_shutdown_keeps_headed_browser_and_shared_driver(
+    fake_runtime, service_clock
+):
+    headed = FakeBrowser()
+    fake_runtime.playwright.chromium.launch.side_effect = [fake_runtime.browser, headed]
+    service = BrowserService(idle_shutdown_enabled=True)
+    await service.initialize()
+    await service._ensure_browser("headed")
+    await headed.new_context()
+    service_clock.now += 1200
+    await service._close_if_idle()
+    assert service._browser is None and service._headed_browser is headed
+    headed.close.assert_not_awaited()
+    fake_runtime.playwright.stop.assert_not_awaited()
+    assert service.ready
+    await service.close()
+
+
+async def test_new_render_during_idle_shutdown_waits_and_uses_replacement(
+    fake_runtime, service_clock
+):
+    service = BrowserService(idle_shutdown_enabled=True)
+    await service.initialize()
+    started, release = asyncio.Event(), asyncio.Event()
+
+    async def close_browser():
+        started.set()
+        await release.wait()
+        await fake_runtime.browser._close()
+
+    fake_runtime.browser.close.side_effect = close_browser
+    replacement = FakeBrowser()
+    fake_runtime.playwright.chromium.launch.return_value = replacement
+    service_clock.now += 1200
+    collector = asyncio.create_task(service._close_if_idle())
+    task = None
+    try:
+        await asyncio.wait_for(started.wait(), timeout=2)
+        task = asyncio.create_task(service.render_html("<html>wake</html>"))
+        await asyncio.sleep(0)
+        assert not task.done() and service._headless_operations == 1
+        release.set()
+        await collector
+        assert await task == b"page-png"
+        assert service._browser is replacement
+        assert not fake_runtime.browser.contexts_created
+    finally:
+        release.set()
+        await asyncio.gather(
+            collector, *([task] if task else []), return_exceptions=True
+        )
+        await service.close()
+
+
+async def test_idle_close_failure_keeps_instance_and_retries_later(
+    fake_runtime, service_clock
+):
+    service = BrowserService(idle_shutdown_enabled=True)
+    await service.initialize()
+    fake_runtime.browser.close.side_effect = PlaywrightError("close failed")
+    service_clock.now += 1200
+    await service._close_if_idle()
+    assert service._browser is fake_runtime.browser and service.ready
+    assert await service.render_html("<html>still running</html>") == b"page-png"
+    fake_runtime.browser.close.side_effect = fake_runtime.browser._close
+    service_clock.now += 1200
+    await service._close_if_idle()
+    assert service._browser is None
+    await service.close()
+
+
+async def test_idle_collector_runs_and_is_cancelled_at_shutdown(fake_runtime):
+    service = BrowserService(idle_shutdown_enabled=True)
+    service.idle_shutdown_timeout = 0.02
+    closed = asyncio.Event()
+
+    async def close_browser():
+        await fake_runtime.browser._close()
+        closed.set()
+
+    fake_runtime.browser.close.side_effect = close_browser
+    await service.initialize()
+    reaper = service._idle_reaper
+    try:
+        await asyncio.wait_for(closed.wait(), timeout=2)
+        # Let the collector publish its sleeping state after browser.close returns.
+        await service._close_if_idle()
+        assert service._browser is None and service.ready
+    finally:
+        await service.close()
+    assert reaper.done() and service._idle_reaper is None
+
+
+async def test_shutdown_during_idle_close_still_releases_browser_and_driver(
+    fake_runtime,
+):
+    service = BrowserService(idle_shutdown_enabled=True)
+    service.idle_shutdown_timeout = 0.02
+    started = asyncio.Event()
+
+    async def close_browser():
+        if not started.is_set():
+            started.set()
+            await asyncio.Event().wait()
+        await fake_runtime.browser._close()
+
+    fake_runtime.browser.close.side_effect = close_browser
+    await service.initialize()
+    reaper = service._idle_reaper
+    try:
+        await asyncio.wait_for(started.wait(), timeout=2)
+    finally:
+        await service.close()
+    assert reaper.done() and not service.ready
+    assert fake_runtime.browser.close.await_count == 2
+    fake_runtime.playwright.stop.assert_awaited_once()
+
+
+async def test_shutdown_during_initial_launch_does_not_leave_an_idle_collector(
+    fake_runtime,
+):
+    service = BrowserService(idle_shutdown_enabled=True)
+    started, release = asyncio.Event(), asyncio.Event()
+
+    async def launch(**kwargs):
+        started.set()
+        await release.wait()
+        return fake_runtime.browser
+
+    fake_runtime.playwright.chromium.launch.side_effect = launch
+    initialization = asyncio.create_task(service.initialize())
+    await asyncio.wait_for(started.wait(), timeout=2)
+    shutdown = asyncio.create_task(service.close())
+    await asyncio.sleep(0)
+    assert service._closing
+    release.set()
+    await asyncio.gather(initialization, shutdown)
+    assert service._idle_reaper is None and not service.ready
+    fake_runtime.browser.close.assert_awaited_once()
+    fake_runtime.playwright.stop.assert_awaited_once()
+
+
+async def test_failed_wake_can_be_retried_without_stopping_the_service(
+    fake_runtime, service_clock
+):
+    service = BrowserService(idle_shutdown_enabled=True)
+    await service.initialize()
+    service_clock.now += 1200
+    await service._close_if_idle()
+    replacement = FakeBrowser()
+    fake_runtime.playwright.chromium.launch.side_effect = [
+        PlaywrightError("wake failed"),
+        replacement,
+    ]
+    try:
+        with pytest.raises(BrowserServiceError, match="启动失败"):
+            await service.render_html("<html>failed wake</html>")
+        assert service.ready and service._browser is None
+        assert service._headless_operations == 0
+        assert await service.render_pdf("<html>retry</html>") == b"document-pdf"
+        assert service._browser is replacement
+    finally:
+        await service.close()
+
+
+@pytest.mark.parametrize(
+    "settings",
+    [
+        {"idle_shutdown_enabled": 1},
+        {"idle_shutdown_enabled": "true"},
+        {"idle_shutdown_timeout": True},
+        {"idle_shutdown_timeout": 29},
+        {"idle_shutdown_timeout": 86401},
+        {"idle_shutdown_timeout": "1200"},
+    ],
+)
+def test_invalid_idle_shutdown_configuration(settings):
+    with pytest.raises(BrowserServiceError, match="idle_shutdown"):
+        BrowserService(**settings)
 
 
 def test_invalid_viewports_and_limits_fail_before_startup():

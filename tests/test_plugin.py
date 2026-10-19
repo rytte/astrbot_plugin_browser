@@ -58,6 +58,8 @@ def test_plugin_owns_one_configured_service():
                 "max_concurrent_sessions": 3,
                 "queue_timeout": 20,
                 "startup_timeout": 15,
+                "idle_shutdown_enabled": True,
+                "idle_shutdown_timeout": 2400,
             },
         },
     )
@@ -65,6 +67,8 @@ def test_plugin_owns_one_configured_service():
     assert plugin.service.max_concurrent_sessions == 3
     assert plugin.service.queue_timeout == 20
     assert plugin.service.startup_timeout == 15
+    assert plugin.service.idle_shutdown_enabled is True
+    assert plugin.service.idle_shutdown_timeout == 2400
 
 
 def test_plugin_rejects_unknown_settings():
@@ -82,6 +86,14 @@ def test_plugin_rejects_unknown_settings():
         ({"browser": None}, "browser 必须是配置对象"),
         ({"browser": []}, "browser 必须是配置对象"),
         ({"browser": {"unknown": 1}}, "未知浏览器基础配置.*browser.unknown"),
+        (
+            {"browser": {"idle_shutdown_enabled": 1}},
+            "idle_shutdown_enabled 必须是布尔值",
+        ),
+        (
+            {"browser": {"idle_shutdown_timeout": 0}},
+            "idle_shutdown_timeout 必须是",
+        ),
     ],
 )
 def test_plugin_rejects_flat_or_invalid_browser_settings(config, error):
@@ -99,6 +111,7 @@ def test_plugin_reads_grouped_browser_use_settings():
                 "max_sessions": 2,
                 "idle_timeout": 120,
                 "action_timeout": 10,
+                "user_whitelist": [" alice ", "bob", "alice"],
             }
         },
     )
@@ -107,6 +120,7 @@ def test_plugin_reads_grouped_browser_use_settings():
     assert plugin.agent.max_sessions == 2
     assert plugin.agent.idle_timeout == 120
     assert plugin.agent.action_timeout == 10
+    assert plugin.user_whitelist == {"alice", "bob"}
 
 
 @pytest.mark.parametrize(
@@ -144,10 +158,13 @@ def test_schema_loads_both_configuration_groups(tmp_path):
             "max_concurrent_sessions": 4,
             "queue_timeout": 30,
             "startup_timeout": 30,
+            "idle_shutdown_enabled": False,
+            "idle_shutdown_timeout": 1200,
         },
         "browser_use": {
             "enabled": True,
             "headed_enabled": True,
+            "user_whitelist": [],
             "tool_level": "basic",
             "max_sessions": 4,
             "idle_timeout": 600,
@@ -157,6 +174,11 @@ def test_schema_loads_both_configuration_groups(tmp_path):
     plugin = BrowserPlugin(SimpleNamespace(), config)
     assert plugin.browser_use_enabled is True
     assert plugin.agent.tool_level == "basic"
+    assert plugin.service.idle_shutdown_enabled is False
+    assert plugin.service.idle_shutdown_timeout == 1200
+    assert schema["browser"]["items"]["idle_shutdown_timeout"]["condition"] == {
+        "idle_shutdown_enabled": True
+    }
     assert schema["browser_use"]["items"]["tool_level"]["options"] == [
         "basic",
         "standard",
@@ -260,11 +282,12 @@ async def test_plugin_lifecycle_delegates_to_service(tool_manager):
     plugin.service.close.assert_awaited_once()
 
 
-def event(sender="alice", origin="test:group:one"):
+def event(sender="alice", origin="test:group:one", *, admin=True):
     return SimpleNamespace(
         unified_msg_origin=origin,
         get_sender_id=lambda: sender,
         get_extra=lambda key: None,
+        is_admin=lambda: admin,
     )
 
 
@@ -292,6 +315,131 @@ async def test_tool_preserves_error_code():
         "code": "NO_SESSION",
         "message": "请先打开网页",
     }
+
+
+@pytest.mark.parametrize("name", sorted(FULL_TOOLS))
+async def test_unauthorized_sender_cannot_access_any_browser_tool(name):
+    context = SimpleNamespace(get_using_provider_async=AsyncMock())
+    plugin = BrowserPlugin(context, {"browser_use": {"tool_level": "full"}})
+    plugin.agent.execute = AsyncMock()
+    plugin.agent.require_action = Mock()
+    plugin._import_attachments = AsyncMock()
+    current = event(admin=False)
+    current.send = AsyncMock()
+    owner = (current.unified_msg_origin, current.get_sender_id())
+    snapshot = {"cookies": [], "origins": []}
+    plugin.agent.storage.write_state(owner, snapshot)
+
+    result = await plugin._tool(current, name.removeprefix("browser_"))
+
+    assert result.isError
+    assert json.loads(result.content[0].text)["error"]["code"] == "PERMISSION_DENIED"
+    plugin.agent.require_action.assert_not_called()
+    plugin.agent.execute.assert_not_awaited()
+    plugin._import_attachments.assert_not_awaited()
+    context.get_using_provider_async.assert_not_awaited()
+    current.send.assert_not_awaited()
+    assert not plugin.agent._sessions and not plugin.agent.storage.files
+    assert plugin.agent.storage.read_state(owner) == snapshot
+    assert plugin.service._browser is None and plugin.service._headed_browser is None
+    assert not plugin._tool_tasks
+
+
+@pytest.mark.parametrize("admin", [False, True])
+@pytest.mark.parametrize(
+    "origin", ["test:private:alice", "test:group:one", "test:group:two"]
+)
+async def test_personal_access_allows_private_and_any_group(admin, origin):
+    plugin = BrowserPlugin(
+        SimpleNamespace(),
+        {"browser_use": {"user_whitelist": [] if admin else ["alice"]}},
+    )
+    plugin.agent.execute = AsyncMock(return_value=BrowserResult({"success": True}))
+    current = event(origin=origin, admin=admin)
+    result = await plugin.browser_open(current, "https://example.com")
+    assert not result.isError
+    plugin.agent.execute.assert_awaited_once_with(
+        (origin, "alice"), "open", url="https://example.com", new_tab=False
+    )
+
+
+@pytest.mark.parametrize("admin", [False, True])
+@pytest.mark.parametrize(
+    "action,args",
+    [
+        ("mode", {"mode": "headed"}),
+        ("evaluate", {"observation_id": "obs_test", "expression": "document.title"}),
+        (
+            "intercept",
+            {"operation": "add", "rule": {"url_pattern": "*", "action": "abort"}},
+        ),
+        ("state", {"operation": "save"}),
+        ("upload", {"operation": "list"}),
+        ("download", {"operation": "list"}),
+    ],
+)
+async def test_admin_and_whitelisted_user_have_equal_tool_permissions(
+    admin, action, args
+):
+    plugin = BrowserPlugin(
+        SimpleNamespace(),
+        {
+            "browser_use": {
+                "tool_level": "full",
+                "user_whitelist": [] if admin else ["alice"],
+            }
+        },
+    )
+    plugin.agent.execute = AsyncMock(return_value=BrowserResult({"success": True}))
+    plugin._import_attachments = AsyncMock(return_value=[])
+    result = await plugin._tool(event(admin=admin), action, **args)
+    assert not result.isError
+    plugin.agent.execute.assert_awaited_once_with(
+        ("test:group:one", "alice"), action, **args
+    )
+
+
+async def test_authorizing_one_person_does_not_authorize_their_group():
+    plugin = BrowserPlugin(
+        SimpleNamespace(), {"browser_use": {"user_whitelist": ["alice", "group-1"]}}
+    )
+    plugin.agent.execute = AsyncMock()
+    current = event(sender="bob", origin="test:group:group-1", admin=False)
+    current.get_group_id = Mock(return_value="group-1")
+    result = await plugin.browser_open(current, "https://example.com")
+    assert json.loads(result.content[0].text)["error"]["code"] == "PERMISSION_DENIED"
+    current.get_group_id.assert_not_called()
+    plugin.agent.execute.assert_not_awaited()
+
+
+async def test_access_is_rechecked_on_each_call():
+    plugin = BrowserPlugin(SimpleNamespace(), {})
+    plugin.agent.execute = AsyncMock(return_value=BrowserResult({"success": True}))
+    current = event()
+    assert not (await plugin.browser_mode(current)).isError
+    current.is_admin = lambda: False
+    result = await plugin.browser_mode(current)
+    assert json.loads(result.content[0].text)["error"]["code"] == "PERMISSION_DENIED"
+    plugin.agent.execute.assert_awaited_once()
+
+
+async def test_missing_admin_identity_is_denied_by_default():
+    plugin = BrowserPlugin(SimpleNamespace(), {})
+    plugin.agent.execute = AsyncMock()
+    current = event()
+    del current.is_admin
+    current.role = "admin"
+    result = await plugin.browser_mode(current)
+    assert json.loads(result.content[0].text)["error"]["code"] == "PERMISSION_DENIED"
+    plugin.agent.execute.assert_not_awaited()
+
+
+@pytest.mark.parametrize(
+    "value", [None, "alice", {}, True, 123, [123], [None], [""], ["  "]]
+)
+def test_personal_whitelist_rejects_invalid_configuration(value):
+    with pytest.raises(BrowserServiceError, match="user_whitelist"):
+        BrowserPlugin(SimpleNamespace(), {"browser_use": {"user_whitelist": value}})
 
 
 async def test_screenshot_is_image_content_and_survives_astrbot_tool_executor():

@@ -27,6 +27,19 @@
         "type": "int",
         "default": 30,
         "hint": "允许 1～120。插件加载时启动并检查共用的 Chromium，BrowserUse 和离线渲染都依赖它。"
+      },
+      "idle_shutdown_enabled": {
+        "description": "空闲时关闭浏览器",
+        "type": "bool",
+        "default": false,
+        "hint": "无头实例空闲超时后关闭，下次浏览或渲染时自动启动。保留会话、执行中和排队的任务会阻止关闭；保存后重载生效。"
+      },
+      "idle_shutdown_timeout": {
+        "description": "浏览器实例空闲超时（秒）",
+        "type": "int",
+        "default": 1200,
+        "condition": {"idle_shutdown_enabled": true},
+        "hint": "允许 30～86400。所有无头会话和任务结束后开始计时；唤醒耗时计入请求超时。"
       }
     }
   },
@@ -38,7 +51,14 @@
         "description": "启用 BrowserUse 模型工具",
         "type": "bool",
         "default": true,
-        "hint": "保存后重载插件生效。关闭时不向模型提供 browser_* 工具，不占用工具定义上下文，也不启动 Agent 会话回收任务。"
+        "hint": "关闭后不向模型提供 browser_* 工具，不占用工具定义上下文，也不启动 Agent 会话回收任务。"
+      },
+      "user_whitelist": {
+        "description": "BrowserUse 白名单",
+        "type": "list",
+        "items": {"type": "string"},
+        "default": [],
+        "hint": "填写个人用户 ID；管理员默认可用。"
       },
       "tool_level": {
         "description": "模型工具层级",
@@ -52,7 +72,7 @@
         "description": "允许按需使用有头浏览器",
         "type": "bool",
         "default": true,
-        "hint": "只有明确调用 browser_mode(headed) 才启动窗口，显示在 AstrBot 所在主机的图形桌面；最多一个有头实例和一个有头会话，用完释放。无头浏览器和渲染始终保持原模式。"
+        "hint": "只有明确指定时才启动窗口，显示在 AstrBot 所在主机的图形桌面；最多一个有头实例和一个有头会话，用完释放。无头浏览器和渲染始终保持原模式。"
       },
       "max_sessions": {
         "description": "保留的 Agent 浏览器会话上限",
@@ -64,7 +84,7 @@
         "description": "Agent 会话空闲回收时间（秒）",
         "type": "int",
         "default": 600,
-        "hint": "允许 30～3600。有头模式的人工点击、键盘和滚动也会刷新空闲计时。空闲到期自动保存后关闭会话，有头实例同时释放；显式 clear 后当前会话不再自动保存。"
+        "hint": "允许 30～3600。无操作计时，超时后关闭会话。有头模式的人工操作也会刷新空闲计时且超时后会释放实例。"
       },
       "action_timeout": {
         "description": "Agent 单次工具总超时（秒）",

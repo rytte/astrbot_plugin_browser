@@ -1,4 +1,4 @@
-"""Manage a resident headless Chromium and an optional headed Chromium."""
+"""Manage shared headless Chromium with optional idle shutdown and headed mode."""
 
 from __future__ import annotations
 
@@ -7,13 +7,20 @@ import os
 import platform
 import shutil
 import sys
+import time
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager, suppress
 from pathlib import Path
 from typing import Any
 
 from astrbot.api import logger
-from playwright.async_api import Browser, Page, Playwright, async_playwright
+from playwright.async_api import (
+    Browser,
+    BrowserContext,
+    Page,
+    Playwright,
+    async_playwright,
+)
 from playwright.async_api import Error as PlaywrightError
 
 DEFAULT_VIEWPORT = {"width": 1280, "height": 720}
@@ -126,6 +133,8 @@ class BrowserService:
         max_concurrent_sessions: Maximum number of concurrent browser operations.
         queue_timeout: Maximum time in seconds to wait for an execution slot.
         startup_timeout: Maximum time in seconds allowed for a browser launch.
+        idle_shutdown_enabled: Close unused headless Chromium until the next request.
+        idle_shutdown_timeout: Seconds without tasks or contexts before shutdown.
     """
 
     def __init__(
@@ -134,6 +143,8 @@ class BrowserService:
         max_concurrent_sessions: int = 4,
         queue_timeout: int = 30,
         startup_timeout: int = 30,
+        idle_shutdown_enabled: bool = False,
+        idle_shutdown_timeout: int = 1200,
     ) -> None:
         if not isinstance(browser_executable, str):
             raise BrowserServiceError("browser_executable 必须是字符串。")
@@ -161,11 +172,20 @@ class BrowserService:
             raise BrowserServiceError("queue_timeout 必须是 1～300 的整数。")
         if type(startup_timeout) is not int or not 1 <= startup_timeout <= 120:
             raise BrowserServiceError("startup_timeout 必须是 1～120 的整数。")
+        if type(idle_shutdown_enabled) is not bool:
+            raise BrowserServiceError("idle_shutdown_enabled 必须是布尔值。")
+        if (
+            type(idle_shutdown_timeout) is not int
+            or not 30 <= idle_shutdown_timeout <= 86400
+        ):
+            raise BrowserServiceError("idle_shutdown_timeout 必须是 30～86400 的整数。")
 
         self.browser_executable = browser_executable
         self.max_concurrent_sessions = max_concurrent_sessions
         self.queue_timeout = queue_timeout
         self.startup_timeout = startup_timeout
+        self.idle_shutdown_enabled = idle_shutdown_enabled
+        self.idle_shutdown_timeout = idle_shutdown_timeout
         self._semaphore = asyncio.Semaphore(max_concurrent_sessions)
         self._lifecycle_lock = asyncio.Lock()
         self._headed_lock = asyncio.Lock()
@@ -176,18 +196,74 @@ class BrowserService:
         self._launch_options: dict[str, Any] = {}
         self._launching = 0
         self._active_tasks: set[asyncio.Task[Any]] = set()
+        self._headless_operations = 0
+        self._last_headless_use = time.monotonic()
+        self._idle_reaper: asyncio.Task[None] | None = None
+        self._sleeping = False
         self._closing = False
         self._closed = False
 
     @property
     def ready(self) -> bool:
-        """Return whether the browser process is connected and accepting work."""
+        """Return whether requests are accepted, including during idle sleep."""
         return (
             not self._closing
             and not self._closed
-            and self._browser is not None
-            and self._browser.is_connected()
+            and (
+                self._sleeping
+                or (self._browser is not None and self._browser.is_connected())
+            )
         )
+
+    def _touch_headless(self) -> None:
+        self._last_headless_use = time.monotonic()
+
+    def track_context(self, context: BrowserContext) -> None:
+        """Account for a retained headless context without reserving capacity."""
+        if self.idle_shutdown_enabled and context.browser is self._browser:
+            self._touch_headless()
+            context.on("close", self._touch_headless)
+
+    async def _idle_loop(self) -> None:
+        while True:
+            await asyncio.sleep(min(30, self.idle_shutdown_timeout / 2))
+            try:
+                await self._close_if_idle()
+            except Exception:
+                logger.warning(
+                    "Failed to collect idle headless Chromium", exc_info=True
+                )
+
+    async def _close_if_idle(self) -> None:
+        """Close an unused process while serializing with headless startup."""
+        async with self._lifecycle_lock:
+            browser = self._browser
+            if (
+                not self.idle_shutdown_enabled
+                or self._closing
+                or self._closed
+                or browser is None
+            ):
+                return
+            if self._headless_operations or browser.contexts:
+                self._touch_headless()
+                return
+            if time.monotonic() - self._last_headless_use < self.idle_shutdown_timeout:
+                return
+            try:
+                await asyncio.wait_for(browser.close(), timeout=5)
+            except (PlaywrightError, asyncio.TimeoutError):
+                self._touch_headless()
+                if browser.is_connected():
+                    logger.warning(
+                        "Failed to close idle headless Chromium", exc_info=True
+                    )
+                    return
+            self._browser = None
+            self._sleeping = True
+            logger.info(
+                "Idle headless Chromium closed; the next request will restart it"
+            )
 
     async def initialize(self) -> None:
         """Start Chromium and fail plugin loading if it cannot be launched.
@@ -320,6 +396,14 @@ class BrowserService:
                     self._headed_browser = browser
                 else:
                     self._browser = browser
+                    self._sleeping = False
+                    self._touch_headless()
+                    if (
+                        self.idle_shutdown_enabled
+                        and self._idle_reaper is None
+                        and not self._closing
+                    ):
+                        self._idle_reaper = asyncio.create_task(self._idle_loop())
                 return browser
             except BaseException as exc:
                 if isinstance(exc, asyncio.CancelledError):
@@ -404,6 +488,9 @@ class BrowserService:
         registered = task is not None and task not in self._active_tasks
         if registered:
             self._active_tasks.add(task)
+        if mode == "headless":
+            self._headless_operations += 1
+            self._touch_headless()
         acquired = False
         try:
             try:
@@ -423,6 +510,9 @@ class BrowserService:
                 self._semaphore.release()
             if registered:
                 self._active_tasks.discard(task)
+            if mode == "headless":
+                self._headless_operations -= 1
+                self._touch_headless()
 
     @staticmethod
     def _validate_viewport(viewport: dict[str, int] | None) -> dict[str, int]:
@@ -512,6 +602,7 @@ class BrowserService:
                         java_script_enabled=javascript_enabled,
                         service_workers="block",
                     )
+                    self.track_context(context)
                     await context.route("**/*", self._abort_request)
                     page = await context.new_page()
                     timeout_ms = int(timeout * 1000)
@@ -710,6 +801,10 @@ class BrowserService:
         if self._closed or self._closing:
             return
         self._closing = True
+        if self._idle_reaper is not None:
+            self._idle_reaper.cancel()
+            await asyncio.gather(self._idle_reaper, return_exceptions=True)
+            self._idle_reaper = None
         current = asyncio.current_task()
         tasks = [
             task

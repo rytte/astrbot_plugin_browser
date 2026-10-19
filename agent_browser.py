@@ -410,6 +410,7 @@ class AgentBrowser:
             accept_downloads=True,
             storage_state=storage_state,
         )
+        self.service.track_context(context)
         session = AgentSession(context, owner=owner, environment=options, mode=mode)
         try:
             context.set_default_timeout(self.action_timeout * 1000)
