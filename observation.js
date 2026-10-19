@@ -23,7 +23,9 @@
     "[role=checkbox]", "[role=radio]", "[role=combobox]", "[role=tab]",
     "[role=menuitem]", "[role=option]", "[role=switch]", "[role=slider]",
     "[role=searchbox]", "[role=spinbutton]", "[role=listbox]",
-    "[contenteditable]:not([contenteditable=false])", "[tabindex]", "[onclick]"
+    "[contenteditable]:not([contenteditable=false])", "[tabindex]", "[onclick]",
+    "[ondblclick]", "[oncontextmenu]", "[onmouseover]", "[onmouseenter]",
+    "[draggable=true]", "[ondragover]", "[ondrop]"
   ].join(",");
   const elements = [];
   const descriptions = [];
@@ -43,7 +45,7 @@
         style.visibility !== "collapse" && !element.closest("[inert]");
       const inViewport = visible && box.bottom > 0 && box.right > 0 &&
         box.top < innerHeight && box.left < innerWidth;
-      if (visible && element.matches(selector)) {
+      if ((visible && element.matches(selector)) || element.matches('input[type=file]')) {
         candidates.push({element, inViewport});
       }
       if (inViewport && viewportCharacters < 8000) {
@@ -76,6 +78,11 @@
       in_viewport: inViewport
     };
     if (element.tagName === "A") item.href = element.href.slice(0, 2048);
+    if (element.draggable) item.draggable = true;
+    if (element.type === "file") {
+      item.accept = (element.accept || "").slice(0, 300);
+      item.multiple = element.multiple;
+    }
     if ("value" in element && element.type !== "password" && element.type !== "file") {
       item.value = String(element.value).slice(0, 1000);
     }
@@ -95,6 +102,9 @@
     elements, signature, signatures: elements.map(signature),
     document: document.documentElement, revision: 0,
     x: scrollX, y: scrollY, width: innerWidth, height: innerHeight,
+    visual_scale: visualViewport?.scale || 1,
+    visual_x: visualViewport?.offsetLeft || 0,
+    visual_y: visualViewport?.offsetTop || 0,
     url: location.href,
     data: {
       text: text.slice(0, 8000), text_truncated: text.length > 8000,

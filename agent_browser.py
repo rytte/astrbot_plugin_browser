@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import json
 import math
+import mimetypes
 import time
 import uuid
 from contextlib import suppress
@@ -14,12 +15,30 @@ from typing import Any
 from urllib.parse import urlsplit
 
 from astrbot.api import logger
-from playwright.async_api import Browser, BrowserContext, JSHandle, Page, Route
+from playwright.async_api import (
+    Browser,
+    BrowserContext,
+    Download,
+    ElementHandle,
+    JSHandle,
+    Page,
+)
 from playwright.async_api import Error as PlaywrightError
 
+from .browser_advanced import (
+    SERIALIZE_SCRIPT,
+    Interceptor,
+    NetworkMonitor,
+    environment,
+    json_size,
+)
+from .browser_errors import AgentBrowserError
+from .browser_storage import BrowserStorage
+from .browser_tools import TOOL_LEVELS, actions_for_level
 from .service import DEFAULT_VIEWPORT, BrowserService, BrowserServiceError
 
 OBSERVE_SCRIPT = Path(__file__).with_name("observation.js").read_text(encoding="utf-8")
+EXTRACT_SCRIPT = Path(__file__).with_name("extraction.js").read_text(encoding="utf-8")
 MAX_TABS = 8
 MAX_FRAMES = 16
 Owner = tuple[str, str]
@@ -27,23 +46,34 @@ ACTION_PARAMETERS = {
     "open": {"url", "new_tab"},
     "observe": set(),
     "screenshot": set(),
-    "click": {"observation_id", "ref", "x", "y"},
+    "click": {"observation_id", "ref", "x", "y", "button", "click_count"},
+    "hover": {"observation_id", "ref", "x", "y"},
+    "drag": {
+        "observation_id",
+        "source_ref",
+        "target_ref",
+        "start_x",
+        "start_y",
+        "end_x",
+        "end_y",
+    },
     "fill": {"observation_id", "ref", "text"},
     "press": {"observation_id", "key"},
     "select": {"observation_id", "ref", "value"},
     "scroll": {"observation_id", "direction", "pixels"},
-    "wait": {"text"},
+    "wait": {"condition", "value", "state", "frame_index"},
+    "upload": {"operation", "observation_id", "ref", "file_ids"},
+    "download": {"operation", "file_id"},
+    "extract": {"kind", "selector", "frame_index", "limit"},
+    "dialog": {"operation", "dialog_type", "message", "prompt_text"},
+    "state": {"operation"},
+    "network": {"operation", "request_id", "url_pattern", "limit", "include_body"},
+    "intercept": {"operation", "rule_id", "rule"},
+    "emulate": {"operation", "settings"},
+    "evaluate": {"observation_id", "expression", "argument", "frame_index"},
     "tabs": {"operation", "tab_id"},
     "close": set(),
 }
-
-
-class AgentBrowserError(BrowserServiceError):
-    """An actionable error with a stable code for the model."""
-
-    def __init__(self, code: str, message: str) -> None:
-        super().__init__(message)
-        self.code = code
 
 
 @dataclass
@@ -52,6 +82,7 @@ class BrowserResult:
 
     data: dict[str, Any]
     image: bytes | None = None
+    file: Path | None = None
 
 
 @dataclass
@@ -59,6 +90,7 @@ class AgentSession:
     """Own one user's live context, tabs and latest observation."""
 
     context: BrowserContext
+    owner: Owner = ("", "")
     lock: asyncio.Lock = field(default_factory=asyncio.Lock)
     tabs: dict[str, Page] = field(default_factory=dict)
     active_tab: str = ""
@@ -69,7 +101,13 @@ class AgentSession:
     refs: dict[str, tuple[JSHandle, int]] = field(default_factory=dict)
     snapshots: list[JSHandle] = field(default_factory=list)
     screenshot: bool = False
+    coordinate_notice: str = ""
     notices: list[str] = field(default_factory=list)
+    dialog_rule: dict[str, str] | None = None
+    dialogs: list[dict[str, Any]] = field(default_factory=list)
+    network: NetworkMonitor = field(default_factory=NetworkMonitor)
+    interceptor: Interceptor = field(default_factory=Interceptor)
+    environment: dict[str, Any] = field(default_factory=lambda: environment({}))
 
     async def invalidate(self) -> None:
         """Disconnect observation guards and release remote DOM references."""
@@ -77,6 +115,7 @@ class AgentSession:
         self.observation_tab = ""
         self.refs.clear()
         self.screenshot = False
+        self.coordinate_notice = ""
         while self.snapshots:
             snapshot = self.snapshots[-1]
             with suppress(PlaywrightError):
@@ -94,6 +133,8 @@ class AgentBrowser:
         max_sessions: Maximum number of retained online contexts.
         idle_timeout: Seconds before an idle context is closed.
         action_timeout: Total seconds allowed for a tool call, including queueing.
+        data_dir: Plugin-owned directory for explicit login snapshots and temporary files.
+        tool_level: Cumulative model tool level: basic, standard or full.
     """
 
     def __init__(
@@ -103,6 +144,8 @@ class AgentBrowser:
         max_sessions: int = 4,
         idle_timeout: int = 600,
         action_timeout: int = 30,
+        data_dir: Path | None = None,
+        tool_level: str = "basic",
     ) -> None:
         for key, value, lower, upper in (
             ("browser_use.max_sessions", max_sessions, 1, 16),
@@ -115,6 +158,9 @@ class AgentBrowser:
         self.max_sessions = max_sessions
         self.idle_timeout = idle_timeout
         self.action_timeout = action_timeout
+        self.enabled_actions = actions_for_level(tool_level)
+        self.tool_level = tool_level
+        self.storage = BrowserStorage(data_dir)
         self._sessions: dict[Owner, AgentSession] = {}
         self._registry_lock = asyncio.Lock()
         self._tasks: set[asyncio.Task[Any]] = set()
@@ -157,13 +203,6 @@ class AgentBrowser:
             session.refs.clear()
             session.snapshots.clear()
 
-    @staticmethod
-    async def _route(route: Route) -> None:
-        if urlsplit(route.request.url).scheme in {"http", "https"}:
-            await route.continue_()
-        else:
-            await route.abort()
-
     async def _get_session(
         self, owner: Owner, browser: Browser, *, create: bool
     ) -> AgentSession:
@@ -196,33 +235,136 @@ class AgentBrowser:
                     "SESSION_LIMIT",
                     "浏览器会话数量已达上限，请关闭不用的会话或稍后重试。",
                 )
-            context = await browser.new_context(
-                viewport=dict(DEFAULT_VIEWPORT),
-                device_scale_factor=1,
-                java_script_enabled=True,
-                service_workers="block",
-                accept_downloads=False,
-            )
-            session = AgentSession(context)
-            try:
-                context.set_default_timeout(self.action_timeout * 1000)
-                context.set_default_navigation_timeout(self.action_timeout * 1000)
-                await context.route("**/*", self._route)
-                context.on("page", lambda page: self._register_page(session, page))
+            session = await self._new_session(owner, browser)
+            self._sessions[owner] = session
+            return session
 
-                async def dismiss_dialog(dialog: Any) -> None:
-                    session.notices.append(
-                        f"已关闭网页弹窗（{dialog.type}）：{dialog.message[:300]}"
+    async def _new_session(
+        self,
+        owner: Owner,
+        browser: Browser,
+        storage_state: dict | None = None,
+        options: dict[str, Any] | None = None,
+    ) -> AgentSession:
+        options = environment({}) if options is None else options
+        context = await browser.new_context(
+            **options,
+            java_script_enabled=True,
+            service_workers="block",
+            accept_downloads=True,
+            storage_state=storage_state,
+        )
+        session = AgentSession(context, owner=owner, environment=options)
+        try:
+            context.set_default_timeout(self.action_timeout * 1000)
+            context.set_default_navigation_timeout(self.action_timeout * 1000)
+            await context.route("**/*", session.interceptor.route)
+            if "network" in self.enabled_actions:
+                context.on("request", session.network.request)
+                context.on("response", session.network.response)
+                context.on("requestfinished", session.network.finished)
+                context.on(
+                    "requestfailed",
+                    lambda request: session.network.finished(request, failed=True),
+                )
+            context.on("page", lambda page: self._register_page(session, page))
+            if "geolocation" in options:
+                await context.grant_permissions(["geolocation"])
+
+            context.on("dialog", lambda dialog: self._handle_dialog(session, dialog))
+            return session
+        except BaseException:
+            await context.close()
+            raise
+
+    async def _handle_dialog(self, session: AgentSession, dialog: Any) -> None:
+        rule = session.dialog_rule
+        matched = (
+            bool(rule)
+            and (not rule["dialog_type"] or rule["dialog_type"] == dialog.type)
+            and (not rule["message"] or rule["message"] == dialog.message)
+        )
+        operation = rule["operation"] if matched else "dismiss"
+        if matched:
+            session.dialog_rule = None
+        record = {
+            "type": dialog.type,
+            "message": dialog.message[:2000],
+            "default_value": dialog.default_value[:1000],
+            "operation": operation,
+            "matched_rule": matched,
+            "status": "handling",
+        }
+        session.dialogs.append(record)
+        del session.dialogs[:-10]
+        try:
+            if operation == "accept":
+                await dialog.accept(prompt_text=rule["prompt_text"])
+            else:
+                await dialog.dismiss()
+            record["status"] = "handled"
+        except PlaywrightError:
+            record["status"] = "failed"
+        session.notices.append(
+            f"网页弹窗（{dialog.type}）已按 {operation} 处理：{dialog.message[:300]}"
+        )
+        del session.notices[:-5]
+
+    def _start_download(self, session: AgentSession, download: Download) -> None:
+        if self._closed:
+            return
+        task = asyncio.create_task(self._save_download(session, download))
+        self._maintenance.add(task)
+        task.add_done_callback(self._maintenance.discard)
+
+    async def _save_download(self, session: AgentSession, download: Download) -> None:
+        owner = session.owner
+        item = None
+        try:
+            async with self.storage.lock(owner):
+                pending = sum(
+                    f.status == "downloading"
+                    for f in self.storage.files.get(owner, {}).values()
+                )
+                if pending >= 3:
+                    raise AgentBrowserError(
+                        "FILE_LIMIT", "每个用户最多同时下载 3 个文件。"
                     )
-                    del session.notices[:-5]
-                    await dialog.dismiss()
-
-                context.on("dialog", dismiss_dialog)
-                self._sessions[owner] = session
-                return session
-            except BaseException:
-                await context.close()
+                item = self.storage.reserve(
+                    owner, download.suggested_filename, "download"
+                )
+            await asyncio.wait_for(download.save_as(item.path), timeout=120)
+            async with self.storage.lock(owner):
+                self.storage.finish(owner, item)
+        except (
+            PlaywrightError,
+            OSError,
+            AgentBrowserError,
+            asyncio.TimeoutError,
+            asyncio.CancelledError,
+        ) as exc:
+            with suppress(PlaywrightError, asyncio.TimeoutError):
+                await asyncio.wait_for(download.cancel(), timeout=5)
+            if item is not None:
+                self.storage.fail(
+                    item,
+                    str(exc)
+                    if isinstance(exc, AgentBrowserError)
+                    else "下载失败、超时或会话已关闭。",
+                )
+            else:
+                session.notices.append(
+                    str(exc)
+                    if isinstance(exc, AgentBrowserError)
+                    else "无法接收下载文件，请检查文件区容量和磁盘权限。"
+                )
+                del session.notices[:-5]
+            if isinstance(exc, asyncio.CancelledError):
                 raise
+        finally:
+            # save_as copies the file; release Playwright's original temporary copy too.
+            with suppress(PlaywrightError, asyncio.TimeoutError):
+                await asyncio.wait_for(download.delete(), timeout=5)
 
     def _register_page(self, session: AgentSession, page: Page) -> None:
         if len([p for p in session.tabs.values() if not p.is_closed()]) >= MAX_TABS:
@@ -241,6 +383,7 @@ class AgentBrowser:
         session.next_tab += 1
         tab_id = f"tab_{session.next_tab}"
         session.tabs[tab_id] = page
+        page.on("download", lambda download: self._start_download(session, download))
         page.on("close", lambda: session.tabs.pop(tab_id, None))
         if not session.active_tab:
             session.active_tab = tab_id
@@ -273,7 +416,7 @@ class AgentBrowser:
         total_text = 0
         total_elements = 0
         element_budget = 48000
-        for frame in page.frames[:MAX_FRAMES]:
+        for frame_index, frame in enumerate(page.frames[:MAX_FRAMES]):
             if frame.is_detached():
                 continue
             snapshot = await frame.evaluate_handle(OBSERVE_SCRIPT)
@@ -305,7 +448,14 @@ class AgentBrowser:
                 item["ref"] = ref
                 session.refs[ref] = (snapshot, index)
                 data["elements"].append(item)
-            frames.append({"url": frame.url[:2048], "name": frame.name[:200], **data})
+            frames.append(
+                {
+                    "frame_index": frame_index,
+                    "url": frame.url[:2048],
+                    "name": frame.name[:200],
+                    **data,
+                }
+            )
         session.observation_id = "obs_" + uuid.uuid4().hex[:16]
         session.observation_tab = session.active_tab
         return BrowserResult(
@@ -324,8 +474,29 @@ class AgentBrowser:
                     if not tab.is_closed()
                 ],
                 "notices": session.notices[-5:],
+                "dialogs": session.dialogs[-10:],
+                "interception_errors": session.interceptor.errors[-5:],
+                "downloads": [
+                    f.describe()
+                    for f in self.storage.files.get(session.owner, {}).values()
+                    if f.source == "download"
+                ],
             }
         )
+
+    def require_action(self, action: str) -> None:
+        """Reject unavailable tools before accessing browser or attachment state."""
+        if not isinstance(action, str) or action not in ACTION_PARAMETERS:
+            raise AgentBrowserError("UNKNOWN_ACTION", "未知浏览器操作。")
+        if action not in self.enabled_actions:
+            required = next(
+                level for level, actions in TOOL_LEVELS.items() if action in actions
+            )
+            raise AgentBrowserError(
+                "TOOL_LEVEL_REQUIRED",
+                f"browser_{action} 不在当前 {self.tool_level} 工具层级中，"
+                f"请在 BrowserUse 配置组中将 tool_level 调整为 {required} 或更高层级，并重载插件。",
+            )
 
     async def execute(
         self, owner: Owner, action: str, **arguments: Any
@@ -345,28 +516,47 @@ class AgentBrowser:
         """
         if self._closed:
             raise AgentBrowserError("SERVICE_CLOSED", "Agent 浏览器服务已停止。")
-        if (
-            not isinstance(owner, tuple)
-            or len(owner) != 2
-            or any(not isinstance(item, str) or not item for item in owner)
-        ):
-            raise AgentBrowserError("INVALID_OWNER", "无法确定消息来源和发送者。")
-        if not isinstance(action, str) or action not in ACTION_PARAMETERS:
-            raise AgentBrowserError("UNKNOWN_ACTION", "未知浏览器操作。")
+        self.validate_owner(owner)
+        self.require_action(action)
         unknown = set(arguments) - ACTION_PARAMETERS[action]
         if unknown:
             raise AgentBrowserError(
                 "INVALID_ARGUMENT", "未知工具参数：" + ", ".join(sorted(unknown))
             )
         for key, value in arguments.items():
-            if key in {"new_tab", "pixels"}:
-                valid = type(value) is (bool if key == "new_tab" else int)
-            elif key in {"x", "y"}:
+            if key in {
+                "new_tab",
+                "include_body",
+                "pixels",
+                "click_count",
+                "frame_index",
+                "limit",
+            }:
+                valid = type(value) is (
+                    bool if key in {"new_tab", "include_body"} else int
+                )
+            elif key in {"rule", "settings", "argument"}:
+                valid = isinstance(value, dict)
+            elif key == "file_ids":
+                valid = (
+                    isinstance(value, list)
+                    and len(value) <= 10
+                    and all(isinstance(item, str) for item in value)
+                )
+            elif key in {"x", "y", "start_x", "start_y", "end_x", "end_y"}:
                 valid = type(value) in {int, float} and math.isfinite(value)
             else:
                 valid = isinstance(value, str)
             if not valid:
                 raise AgentBrowserError("INVALID_ARGUMENT", f"{key} 的类型或数值无效。")
+        if action == "evaluate":
+            expression = arguments.get("expression", "")
+            if not 1 <= len(expression) <= 20000:
+                raise AgentBrowserError(
+                    "INVALID_ARGUMENT",
+                    "expression 必须是 1～20000 字符的 JavaScript 表达式或函数。",
+                )
+            json_size(arguments.get("argument", {}), 32000)
         task = asyncio.current_task()
         if task is not None:
             self._tasks.add(task)
@@ -377,13 +567,19 @@ class AgentBrowser:
         except asyncio.TimeoutError as exc:
             raise AgentBrowserError(
                 "TIMEOUT",
-                "浏览器工具超时；操作可能已执行，请重新观察确认结果，不要直接重复操作。",
+                "JavaScript 执行超时，当前会话已关闭，请重新打开网站。操作可能已执行。"
+                if action == "evaluate"
+                else "浏览器工具超时；操作可能已执行，请重新观察确认结果，不要直接重复操作。",
             ) from exc
         except PlaywrightError as exc:
             raise AgentBrowserError(
                 "BROWSER_ERROR",
                 "浏览器操作失败，请重新观察页面后决定下一步。"
                 + str(exc).split("\n", 1)[0][:250],
+            ) from exc
+        except OSError as exc:
+            raise AgentBrowserError(
+                "STORAGE_ERROR", "浏览器文件存储读写失败，请检查磁盘空间和目录权限。"
             ) from exc
         except BrowserServiceError as exc:
             if isinstance(exc, AgentBrowserError):
@@ -393,9 +589,75 @@ class AgentBrowser:
             if task is not None:
                 self._tasks.discard(task)
 
+    @staticmethod
+    def validate_owner(owner: Owner) -> None:
+        if (
+            not isinstance(owner, tuple)
+            or len(owner) != 2
+            or any(not isinstance(item, str) or not item for item in owner)
+        ):
+            raise AgentBrowserError("INVALID_OWNER", "无法确定消息来源和发送者。")
+
+    async def import_attachment(
+        self, owner: Owner, path: Path, name: str, key: str
+    ) -> None:
+        self.validate_owner(owner)
+        if self._closed:
+            raise AgentBrowserError("SERVICE_CLOSED", "Agent 浏览器服务已停止。")
+        await self.storage.import_file(owner, path, name, key)
+
     async def _execute(
         self, owner: Owner, action: str, args: dict[str, Any]
     ) -> BrowserResult:
+        if action == "emulate":
+            operation, settings = (
+                args.get("operation", "status"),
+                args.get("settings", {}),
+            )
+            if operation not in {"status", "set", "reset"} or (
+                settings and operation != "set"
+            ):
+                raise AgentBrowserError(
+                    "INVALID_ARGUMENT",
+                    "operation 为 status/set/reset，settings 仅用于 set。",
+                )
+            if operation in {"set", "reset"}:
+                options = environment(settings if operation == "set" else {})
+                async with self.service.operation() as browser:
+                    return await self._replace_session(owner, browser, options=options)
+        if action == "download":
+            return await self._files(owner, args)
+        if action == "upload" and args.get("operation", "list") == "list":
+            if args.get("observation_id") or args.get("ref") or args.get("file_ids"):
+                raise AgentBrowserError(
+                    "INVALID_ARGUMENT", "列出上传文件时不要传入页面目标或文件编号。"
+                )
+            return await self._files(owner, {"operation": "list"})
+        if action == "state":
+            operation = args.get("operation", "status")
+            if operation not in {"status", "save", "restore", "clear"}:
+                raise AgentBrowserError(
+                    "INVALID_ARGUMENT", "operation 为 status/save/restore/clear。"
+                )
+            if operation in {"status", "clear"}:
+                async with self.storage.lock(owner):
+                    path = self.storage.state_path(owner)
+                    if operation == "clear":
+                        path.unlink(missing_ok=True)
+                    return BrowserResult(
+                        {
+                            "success": True,
+                            "saved": path.is_file(),
+                            "live_session_unchanged": True,
+                        }
+                    )
+            if operation == "restore":
+                async with self.storage.lock(owner):
+                    saved = self.storage.read_state(owner)
+                async with self.service.operation() as browser:
+                    result = await self._replace_session(owner, browser, saved=saved)
+                    result.data["restored"] = True
+                    return result
         if action == "open":
             url = args.get("url")
             if not isinstance(url, str) or len(url) > 8192:
@@ -419,7 +681,11 @@ class AgentBrowser:
             if type(args.get("new_tab", False)) is not bool:
                 raise AgentBrowserError("INVALID_ARGUMENT", "new_tab 必须是布尔值。")
         async with self.service.operation() as browser:
-            session = await self._get_session(owner, browser, create=action == "open")
+            session = await self._get_session(
+                owner,
+                browser,
+                create=action in {"open", "network", "intercept", "emulate"},
+            )
             async with session.lock:
                 if self._sessions.get(owner) is not session:
                     raise AgentBrowserError(
@@ -428,15 +694,496 @@ class AgentBrowser:
                 session.last_used = time.monotonic()
                 try:
                     return await self._act(owner, session, action, args)
-                except BaseException:
-                    await session.invalidate()
+                except BaseException as exc:
+                    if action == "evaluate" and isinstance(exc, asyncio.CancelledError):
+                        await self._drop(owner, session)
+                    else:
+                        try:
+                            await asyncio.wait_for(session.invalidate(), timeout=1)
+                        except asyncio.TimeoutError:
+                            await self._drop(owner, session)
                     raise
                 finally:
                     session.last_used = time.monotonic()
 
+    async def _replace_session(
+        self,
+        owner: Owner,
+        browser: Browser,
+        *,
+        saved: dict | None = None,
+        options: dict[str, Any] | None = None,
+    ) -> BrowserResult:
+        """Commit a rebuilt context only after it is usable; retain the old one on failure."""
+        async with self._registry_lock:
+            previous = self._sessions.get(owner)
+            if previous is None and len(self._sessions) >= self.max_sessions:
+                raise AgentBrowserError("SESSION_LIMIT", "浏览器会话数量已达上限。")
+            async with previous.lock if previous else asyncio.Lock():
+                if previous is not None:
+                    if saved is None:
+                        if previous.context.browser is not browser:
+                            raise AgentBrowserError(
+                                "SESSION_LOST",
+                                "浏览器已重启，不能保留原会话；请重新打开网站。",
+                            )
+                        saved = await previous.context.storage_state(indexed_db=True)
+                    if options is None:
+                        options = previous.environment
+                session = await self._new_session(owner, browser, saved, options)
+                try:
+                    await session.context.new_page()
+                    if previous is not None:
+                        session.interceptor.rules = dict(previous.interceptor.rules)
+                        session.network.active = previous.network.active
+                        session.network.pattern = previous.network.pattern
+                        await self._drop(owner, previous)
+                    self._sessions[owner] = session
+                except BaseException:
+                    await session.context.close()
+                    raise
+                return BrowserResult(
+                    {
+                        "success": True,
+                        "environment": session.environment,
+                        "session_rebuilt": True,
+                        "message": "会话已重建，登录存储已载入；旧标签页和元素编号已失效，请调用 browser_open 打开网站。网络记录与弹窗规则已清空。",
+                    }
+                )
+
+    async def _files(self, owner: Owner, args: dict[str, Any]) -> BrowserResult:
+        operation, file_id = args.get("operation", "list"), args.get("file_id", "")
+        if operation not in {"list", "wait", "send", "delete"}:
+            raise AgentBrowserError(
+                "INVALID_ARGUMENT", "operation 为 list/wait/send/delete。"
+            )
+        if operation == "list":
+            if file_id:
+                raise AgentBrowserError(
+                    "INVALID_ARGUMENT", "列出文件时不要传 file_id。"
+                )
+            async with self.storage.lock(owner):
+                return BrowserResult(
+                    {
+                        "success": True,
+                        "files": [
+                            f.describe()
+                            for f in self.storage.files.get(owner, {}).values()
+                        ],
+                    }
+                )
+        async with self.storage.lock(owner):
+            item = self.storage.get(owner, file_id)
+            if operation == "delete":
+                self.storage.delete(owner, file_id)
+                return BrowserResult({"success": True, "deleted": file_id})
+        if operation == "wait":
+            await item.done.wait()
+        async with self.storage.lock(owner):
+            item = self.storage.get(owner, file_id, ready=operation == "send")
+            data = {"success": item.status != "failed", "file": item.describe()}
+            if item.status == "failed":
+                data["error"] = {"code": "DOWNLOAD_FAILED", "message": item.error}
+            return BrowserResult(
+                data,
+                file=item.path if operation == "send" else None,
+            )
+
+    async def _evaluate(
+        self, session: AgentSession, page: Page, args: dict[str, Any]
+    ) -> BrowserResult:
+        self._check_observation(session, args.get("observation_id", ""))
+        for snapshot in session.snapshots:
+            if not await snapshot.evaluate(
+                "state => state.document === document.documentElement && state.url === location.href"
+            ):
+                raise AgentBrowserError(
+                    "STALE_OBSERVATION", "网页已跳转，请重新观察后再运行脚本。"
+                )
+        frame = self._frame(page, args.get("frame_index", 0))
+        await session.invalidate()
+        handle = None
+        try:
+            handle = await frame.evaluate_handle(
+                args["expression"], args.get("argument", {})
+            )
+            serialized = await handle.evaluate(SERIALIZE_SCRIPT)
+        except PlaywrightError as exc:
+            raise AgentBrowserError(
+                "SCRIPT_ERROR", "页面脚本执行失败：" + str(exc).split("\n", 1)[0][:250]
+            ) from exc
+        finally:
+            if handle is not None:
+                with suppress(PlaywrightError, asyncio.TimeoutError):
+                    await asyncio.wait_for(handle.dispose(), timeout=1)
+        if serialized.get("error"):
+            raise AgentBrowserError(
+                "SCRIPT_RESULT_UNSUPPORTED",
+                "脚本返回值不能转为 JSON，请返回普通数据，避免 DOM 节点、循环引用、BigInt 和非有限数值。",
+            )
+        result = await self._observe(session)
+        result.data["evaluation"] = (
+            {"result_preview": serialized["serialized"], "truncated": True}
+            if serialized["truncated"]
+            else {"result": json.loads(serialized["serialized"]), "truncated": False}
+        )
+        return result
+
+    @staticmethod
+    def _frame(page: Page, index: int):
+        if not 0 <= index < min(len(page.frames), MAX_FRAMES):
+            raise AgentBrowserError(
+                "INVALID_FRAME", "frame_index 不存在，请使用最新观察中的 frame_index。"
+            )
+        return page.frames[index]
+
+    async def _wait(
+        self, session: AgentSession, page: Page, args: dict[str, Any]
+    ) -> BrowserResult:
+        condition, value = args.get("condition", "text"), args.get("value", "")
+        state, index = args.get("state", ""), args.get("frame_index", 0)
+        if (
+            condition not in {"text", "selector", "url", "load"}
+            or not 1 <= len(value) <= 2000
+        ):
+            raise AgentBrowserError(
+                "INVALID_ARGUMENT",
+                "condition 为 text/selector/url/load，value 为 1～2000 字符。",
+            )
+        frame = self._frame(page, index)
+        if condition in {"text", "selector"}:
+            state = state or "visible"
+            allowed = (
+                {"visible", "hidden"}
+                if condition == "text"
+                else {"visible", "hidden", "attached", "detached"}
+            )
+            if state not in allowed:
+                raise AgentBrowserError(
+                    "INVALID_ARGUMENT",
+                    "text 状态为 visible/hidden；selector 另支持 attached/detached。",
+                )
+            locator = (
+                frame.get_by_text(value, exact=False)
+                if condition == "text"
+                else frame.locator("css=" + value)
+            )
+            if state in {"visible", "hidden"}:
+                locator = locator.filter(visible=True)
+            await session.invalidate()
+            await locator.first.wait_for(state=state)
+        else:
+            if index != 0 or state:
+                raise AgentBrowserError(
+                    "INVALID_ARGUMENT", "url/load 等待仅支持主页面，state 请留空。"
+                )
+            if condition == "load" and value not in {"domcontentloaded", "load"}:
+                raise AgentBrowserError(
+                    "INVALID_ARGUMENT", "load 的 value 为 domcontentloaded 或 load。"
+                )
+            if condition == "url" and not value.startswith(("http://", "https://")):
+                raise AgentBrowserError(
+                    "INVALID_ARGUMENT",
+                    "url 的 value 必须为 HTTP/HTTPS 网址，可使用 * 通配符。",
+                )
+            await session.invalidate()
+            if condition == "load":
+                await page.wait_for_load_state(value)
+            else:
+                await page.wait_for_url(value, wait_until="domcontentloaded")
+        return await self._observe(session)
+
+    async def _extract(self, page: Page, args: dict[str, Any]) -> BrowserResult:
+        kind, selector = args.get("kind", "tables"), args.get("selector", "")
+        limit, index = args.get("limit", 100), args.get("frame_index", 0)
+        if (
+            kind not in {"tables", "links", "lists", "text"}
+            or len(selector) > 2000
+            or not 1 <= limit <= 200
+        ):
+            raise AgentBrowserError(
+                "INVALID_ARGUMENT",
+                "kind 为 tables/links/lists/text，limit 为 1～200 的整数，selector 最多 2000 字符。",
+            )
+        frame = self._frame(page, index)
+        extracted = await frame.evaluate(
+            EXTRACT_SCRIPT, {"kind": kind, "selector": selector, "limit": limit}
+        )
+        if extracted.get("error"):
+            raise AgentBrowserError(
+                "INVALID_SELECTOR", "selector 不是有效的 CSS 选择器。"
+            )
+        return BrowserResult(
+            {
+                "success": True,
+                "frame_index": index,
+                "url": frame.url[:2048],
+                **extracted,
+            }
+        )
+
+    async def _upload(
+        self, owner: Owner, session: AgentSession, args: dict[str, Any]
+    ) -> BrowserResult:
+        operation, file_ids = args.get("operation", "list"), args.get("file_ids", [])
+        if (
+            operation not in {"set", "clear"}
+            or (operation == "set" and not file_ids)
+            or (operation == "clear" and file_ids)
+        ):
+            raise AgentBrowserError(
+                "INVALID_ARGUMENT",
+                "operation 为 list/set/clear；set 需传 file_ids，clear 不传文件编号。",
+            )
+        self._check_observation(session, args.get("observation_id", ""))
+        target = await self._resolve_element(session, args.get("ref", ""))
+        try:
+            info = await target.evaluate(
+                "el => ({file: el.tagName === 'INPUT' && el.type === 'file', multiple: el.multiple})"
+            )
+            if not info["file"]:
+                raise AgentBrowserError(
+                    "INVALID_TARGET", "目标必须是观察中的文件输入框（type=file）。"
+                )
+            if len(file_ids) > 1 and not info["multiple"]:
+                raise AgentBrowserError(
+                    "INVALID_ARGUMENT", "该文件输入框只接受一个文件。"
+                )
+            async with self.storage.lock(owner):
+                files = [
+                    self.storage.get(owner, file_id, ready=True) for file_id in file_ids
+                ]
+                await session.invalidate()
+                # Buffers hide opaque server filenames from the website and preserve the supplied name.
+                await target.set_input_files(
+                    [
+                        {
+                            "name": f.name,
+                            "mimeType": mimetypes.guess_type(f.name)[0]
+                            or "application/octet-stream",
+                            "buffer": f.path.read_bytes(),
+                        }
+                        for f in files
+                    ]
+                )
+        finally:
+            await target.dispose()
+        return await self._observe(session)
+
+    def _dialog(self, session: AgentSession, args: dict[str, Any]) -> BrowserResult:
+        operation = args.get("operation", "list")
+        dialog_type, message, prompt = (
+            args.get("dialog_type", ""),
+            args.get("message", ""),
+            args.get("prompt_text", ""),
+        )
+        if (
+            operation not in {"list", "accept", "dismiss", "clear"}
+            or dialog_type not in {"", "alert", "confirm", "prompt", "beforeunload"}
+            or len(message) > 2000
+            or len(prompt) > 2000
+        ):
+            raise AgentBrowserError(
+                "INVALID_ARGUMENT",
+                "operation 为 list/accept/dismiss/clear；dialog_type 为 alert/confirm/prompt/beforeunload 或空，文字最多 2000 字符。",
+            )
+        if (operation in {"list", "clear"} and (dialog_type or message or prompt)) or (
+            prompt and (operation != "accept" or dialog_type not in {"", "prompt"})
+        ):
+            raise AgentBrowserError(
+                "INVALID_ARGUMENT",
+                "查询/清除规则时不传匹配条件；prompt_text 仅用于接受 prompt。",
+            )
+        if operation == "clear":
+            session.dialog_rule = None
+        elif operation != "list":
+            session.dialog_rule = {
+                "operation": operation,
+                "dialog_type": dialog_type,
+                "message": message,
+                "prompt_text": prompt,
+            }
+        return BrowserResult(
+            {
+                "success": True,
+                "next_dialog": session.dialog_rule,
+                "history": session.dialogs[-10:],
+            }
+        )
+
+    async def _resolve_element(self, session: AgentSession, ref: str) -> ElementHandle:
+        """Resolve an observed DOM node without switching to a replacement node."""
+        reference = session.refs.get(ref)
+        if reference is None:
+            raise AgentBrowserError("INVALID_REF", "元素编号不存在，请重新观察页面。")
+        snapshot, index = reference
+        valid = await snapshot.evaluate(
+            """(state, index) => state.elements[index]?.isConnected &&
+            state.signature(state.elements[index]) === state.signatures[index]""",
+            index,
+        )
+        if not valid:
+            raise AgentBrowserError("STALE_ELEMENT", "目标元素已变化，请重新观察页面。")
+        elements = await snapshot.get_property("elements")
+        try:
+            handle = await elements.get_property(str(index))
+        finally:
+            await elements.dispose()
+        target = handle.as_element()
+        if target is None:
+            await handle.dispose()
+            raise AgentBrowserError("STALE_ELEMENT", "目标元素已失效，请重新观察页面。")
+        return target
+
+    async def _check_coordinates(
+        self, session: AgentSession, page: Page, points: tuple[tuple[float, float], ...]
+    ) -> None:
+        """Validate every coordinate against the same unchanged screenshot."""
+        if not session.screenshot:
+            raise AgentBrowserError(
+                "COORDINATES_UNAVAILABLE"
+                if session.coordinate_notice
+                else "SCREENSHOT_REQUIRED",
+                session.coordinate_notice or "坐标操作前请先获取当前视口截图。",
+            )
+        viewport = page.viewport_size or DEFAULT_VIEWPORT
+        for x, y in points:
+            if any(
+                isinstance(value, bool)
+                or not isinstance(value, int | float)
+                or not math.isfinite(value)
+                or not 0 <= value < viewport[axis]
+                for value, axis in ((x, "width"), (y, "height"))
+            ):
+                raise AgentBrowserError(
+                    "INVALID_COORDINATES", "坐标必须位于截图视口范围内。"
+                )
+        for snapshot in session.snapshots:
+            valid = await snapshot.evaluate(
+                """state => state.document === document.documentElement &&
+                state.revision === 0 && state.x === scrollX && state.y === scrollY &&
+                state.width === innerWidth && state.height === innerHeight &&
+                state.visual_scale === (visualViewport?.scale || 1) &&
+                state.visual_x === (visualViewport?.offsetLeft || 0) &&
+                state.visual_y === (visualViewport?.offsetTop || 0) &&
+                state.url === location.href"""
+            )
+            if not valid:
+                raise AgentBrowserError(
+                    "STALE_SCREENSHOT", "页面已变化，请重新截图后再操作坐标。"
+                )
+
+    async def _mouse_action(
+        self, session: AgentSession, page: Page, action: str, args: dict[str, Any]
+    ) -> None:
+        """Perform clicks and hover with shared element and screenshot guards."""
+        button, click_count = args.get("button", "left"), args.get("click_count", 1)
+        if action == "click" and (
+            button not in {"left", "right", "middle"} or click_count not in {1, 2}
+        ):
+            raise AgentBrowserError(
+                "INVALID_ARGUMENT",
+                "button 为 left/right/middle，click_count 为整数 1 或 2。",
+            )
+        ref, x, y = args.get("ref", ""), args.get("x", -1), args.get("y", -1)
+        target = None
+        try:
+            if ref:
+                if x != -1 or y != -1:
+                    raise AgentBrowserError(
+                        "INVALID_ARGUMENT", "元素编号和坐标不能同时传入。"
+                    )
+                target = await self._resolve_element(session, ref)
+            else:
+                await self._check_coordinates(session, page, ((x, y),))
+            await session.invalidate()
+            if action == "hover":
+                if target is not None:
+                    await target.hover()
+                else:
+                    await page.mouse.move(x, y)
+            elif target is not None:
+                await target.click(button=button, click_count=click_count)
+            else:
+                await page.mouse.click(x, y, button=button, click_count=click_count)
+        finally:
+            if target is not None:
+                with suppress(PlaywrightError):
+                    await target.dispose()
+
+    @staticmethod
+    async def _drag_point(target: ElementHandle, page: Page) -> tuple[float, float]:
+        """Use an element's center in main-frame CSS coordinates."""
+        box = await target.bounding_box()
+        if box is None:
+            raise AgentBrowserError("STALE_ELEMENT", "拖拽元素不可见，请重新观察页面。")
+        x, y = box["x"] + box["width"] / 2, box["y"] + box["height"] / 2
+        viewport = page.viewport_size or DEFAULT_VIEWPORT
+        if not (0 <= x < viewport["width"] and 0 <= y < viewport["height"]):
+            raise AgentBrowserError(
+                "TARGET_OUTSIDE_VIEWPORT",
+                "拖拽起点和终点需同时位于视口内，请滚动后重新观察，或使用截图坐标。",
+            )
+        return x, y
+
+    async def _drag(
+        self, session: AgentSession, page: Page, args: dict[str, Any]
+    ) -> None:
+        """Drag with real mouse events and release the button on failure or cancel."""
+        source_ref, target_ref = args.get("source_ref", ""), args.get("target_ref", "")
+        start = args.get("start_x", -1), args.get("start_y", -1)
+        end = args.get("end_x", -1), args.get("end_y", -1)
+        targets: list[ElementHandle] = []
+        try:
+            if source_ref or target_ref:
+                if (
+                    not source_ref
+                    or not target_ref
+                    or any(value != -1 for value in (*start, *end))
+                ):
+                    raise AgentBrowserError(
+                        "INVALID_ARGUMENT",
+                        "拖拽需传入两个元素编号或四个截图坐标，不能混用。",
+                    )
+                targets.append(await self._resolve_element(session, source_ref))
+                targets.append(await self._resolve_element(session, target_ref))
+                await session.invalidate()
+                for target in targets:
+                    await self._drag_point(target, page)
+                # Trial hover checks actionability, including occlusion, without
+                # firing hover handlers. Check both endpoints before pressing.
+                for target in reversed(targets):
+                    await target.hover(trial=True)
+                start = await self._drag_point(targets[0], page)
+                end = await self._drag_point(targets[1], page)
+            else:
+                await self._check_coordinates(session, page, (start, end))
+                await session.invalidate()
+            await page.mouse.move(*start)
+            try:
+                await page.mouse.down()
+                await page.mouse.move(*end, steps=20)
+                # A second move over the endpoint delivers dragover for HTML5 DnD.
+                await page.mouse.move(*end)
+                await page.mouse.up()
+            except BaseException:
+                with suppress(PlaywrightError):
+                    await page.mouse.up()
+                raise
+        finally:
+            for target in targets:
+                with suppress(PlaywrightError):
+                    await target.dispose()
+
     async def _act(
         self, owner: Owner, session: AgentSession, action: str, args: dict[str, Any]
     ) -> BrowserResult:
+        if action == "network":
+            return BrowserResult(await session.network.operate(args))
+        if action == "intercept":
+            return BrowserResult(session.interceptor.operate(args))
+        if action == "emulate":
+            return BrowserResult({"success": True, "environment": session.environment})
         if action == "close":
             await self._drop(owner, session)
             return BrowserResult({"success": True, "session_closed": True})
@@ -496,7 +1243,20 @@ class AgentBrowser:
                 )
             await page.goto(args["url"], wait_until="domcontentloaded")
             return await self._observe(session)
+        if action == "dialog":
+            return self._dialog(session, args)
+        if action == "state":
+            async with self.storage.lock(owner):
+                saved = await session.context.storage_state(indexed_db=True)
+                self.storage.write_state(owner, saved)
+            return BrowserResult({"success": True, "saved": True})
+        if action == "upload":
+            return await self._upload(owner, session, args)
         page = self._page(session)
+        if action == "evaluate":
+            return await self._evaluate(session, page, args)
+        if action == "extract":
+            return await self._extract(page, args)
         if action in {"observe", "screenshot"}:
             result = await self._observe(session)
             if action == "screenshot":
@@ -507,23 +1267,22 @@ class AgentBrowser:
                     await snapshot.evaluate(
                         "state => { state.observer.takeRecords(); state.revision = 0; }"
                     )
-                session.screenshot = True
-                result.data["coordinate_click_available"] = True
+                scale = await page.evaluate("visualViewport?.scale || 1")
+                session.screenshot = abs(scale - 1) < 0.001
+                result.data["coordinate_click_available"] = session.screenshot
+                if not session.screenshot:
+                    session.coordinate_notice = "当前页面存在移动端自动缩放，截图坐标与页面 CSS 坐标不同；请使用元素编号操作，或切换到未缩放的环境。"
+                    result.data["coordinate_notice"] = session.coordinate_notice
             return result
         if action == "wait":
-            text = args.get("text")
-            if not isinstance(text, str) or not text or len(text) > 2000:
-                raise AgentBrowserError(
-                    "INVALID_ARGUMENT", "text 必须是 1～2000 字符的待出现文字。"
-                )
-            await session.invalidate()
-            await (
-                page.get_by_text(text, exact=False)
-                .filter(visible=True)
-                .first.wait_for(state="visible")
-            )
-            return await self._observe(session)
+            return await self._wait(session, page, args)
         self._check_observation(session, args.get("observation_id", ""))
+        if action in {"click", "hover", "drag"}:
+            if action == "drag":
+                await self._drag(session, page, args)
+            else:
+                await self._mouse_action(session, page, action, args)
+            return await self._observe(session)
         if action in {"press", "scroll"}:
             for snapshot in session.snapshots:
                 if not await snapshot.evaluate(
@@ -534,68 +1293,8 @@ class AgentBrowser:
                     )
         target = None
         try:
-            if action in {"click", "fill", "select"}:
-                ref = args.get("ref", "")
-                x, y = args.get("x", -1), args.get("y", -1)
-                coordinates = action == "click" and not ref
-                if coordinates:
-                    if not session.screenshot:
-                        raise AgentBrowserError(
-                            "SCREENSHOT_REQUIRED", "坐标点击前请先获取当前视口截图。"
-                        )
-                    viewport = page.viewport_size or DEFAULT_VIEWPORT
-                    if any(
-                        isinstance(value, bool)
-                        or not isinstance(value, int | float)
-                        or not math.isfinite(value)
-                        or not 0 <= value < viewport[axis]
-                        for value, axis in ((x, "width"), (y, "height"))
-                    ):
-                        raise AgentBrowserError(
-                            "INVALID_COORDINATES", "坐标必须位于截图视口范围内。"
-                        )
-                    for snapshot in session.snapshots:
-                        valid = await snapshot.evaluate(
-                            """state => state.document === document.documentElement &&
-                            state.revision === 0 && state.x === scrollX && state.y === scrollY &&
-                            state.width === innerWidth && state.height === innerHeight &&
-                            state.url === location.href"""
-                        )
-                        if not valid:
-                            raise AgentBrowserError(
-                                "STALE_SCREENSHOT",
-                                "页面已变化，请重新截图后再点击坐标。",
-                            )
-                else:
-                    if action == "click" and (x != -1 or y != -1):
-                        raise AgentBrowserError(
-                            "INVALID_ARGUMENT", "元素编号和坐标不能同时传入。"
-                        )
-                    reference = session.refs.get(ref)
-                    if reference is None:
-                        raise AgentBrowserError(
-                            "INVALID_REF", "元素编号不存在，请重新观察页面。"
-                        )
-                    snapshot, index = reference
-                    valid = await snapshot.evaluate(
-                        """(state, index) => state.elements[index]?.isConnected &&
-                        state.signature(state.elements[index]) === state.signatures[index]""",
-                        index,
-                    )
-                    if not valid:
-                        raise AgentBrowserError(
-                            "STALE_ELEMENT", "目标元素已变化，请重新观察页面。"
-                        )
-                    elements = await snapshot.get_property("elements")
-                    try:
-                        handle = await elements.get_property(str(index))
-                        target = handle.as_element()
-                    finally:
-                        await elements.dispose()
-                    if target is None:
-                        raise AgentBrowserError(
-                            "STALE_ELEMENT", "目标元素已失效，请重新观察页面。"
-                        )
+            if action in {"fill", "select"}:
+                target = await self._resolve_element(session, args.get("ref", ""))
             if action == "fill":
                 text = args.get("text")
                 if not isinstance(text, str) or len(text) > 100_000:
@@ -612,12 +1311,6 @@ class AgentBrowser:
                     )
                 await session.invalidate()
                 await target.select_option(value=value)
-            elif action == "click":
-                await session.invalidate()
-                if target is not None:
-                    await target.click()
-                else:
-                    await page.mouse.click(x, y)
             elif action == "press":
                 key = args.get("key")
                 if not isinstance(key, str) or not key or len(key) > 100:
@@ -672,3 +1365,4 @@ class AgentBrowser:
         async with self._registry_lock:
             for owner, session in list(self._sessions.items()):
                 await self._drop(owner, session)
+        self.storage.close()

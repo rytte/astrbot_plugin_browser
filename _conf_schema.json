@@ -38,7 +38,15 @@
         "description": "启用 BrowserUse 模型工具",
         "type": "bool",
         "default": true,
-        "hint": "保存后重载插件生效。关闭时不向模型提供 browser_* 工具，不占用工具定义上下文，也不启动 Agent 会话回收任务；其他插件仍可使用离线渲染服务。"
+        "hint": "保存后重载插件生效。关闭时不向模型提供 browser_* 工具，不占用工具定义上下文，也不启动 Agent 会话回收任务。"
+      },
+      "tool_level": {
+        "description": "模型工具层级",
+        "type": "string",
+        "default": "basic",
+        "options": ["basic", "standard", "full"],
+        "labels": ["基础浏览（12 个工具）", "完整交互（18 个工具）", "高级控制（22 个工具）"],
+        "hint": "高层包含低层全部工具，未启用的工具不占上下文。"
       },
       "max_sessions": {
         "description": "保留的 Agent 浏览器会话上限",
@@ -50,7 +58,7 @@
         "description": "Agent 会话空闲回收时间（秒）",
         "type": "int",
         "default": 600,
-        "hint": "允许 30～3600。空闲到期关闭页面并清除本次登录状态，不保存到磁盘。"
+        "hint": "允许 30～3600。空闲到期关闭页面并清除当前会话状态；不会自动保存，不删除通过 browser_state 显式保存的登录快照。"
       },
       "action_timeout": {
         "description": "Agent 单次工具总超时（秒）",
