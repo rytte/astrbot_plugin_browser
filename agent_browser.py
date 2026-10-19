@@ -8,6 +8,7 @@ import math
 import mimetypes
 import time
 import uuid
+from collections.abc import Iterable
 from contextlib import suppress
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -41,6 +42,7 @@ OBSERVE_SCRIPT = Path(__file__).with_name("observation.js").read_text(encoding="
 EXTRACT_SCRIPT = Path(__file__).with_name("extraction.js").read_text(encoding="utf-8")
 MAX_TABS = 8
 MAX_FRAMES = 16
+STATE_SAVE_TIMEOUT = 5
 Owner = tuple[str, str]
 ACTION_PARAMETERS = {
     "open": {"url", "new_tab"},
@@ -96,6 +98,7 @@ class AgentSession:
     active_tab: str = ""
     next_tab: int = 0
     last_used: float = field(default_factory=time.monotonic)
+    auto_save: bool = True
     observation_id: str = ""
     observation_tab: str = ""
     refs: dict[str, tuple[JSHandle, int]] = field(default_factory=dict)
@@ -133,7 +136,7 @@ class AgentBrowser:
         max_sessions: Maximum number of retained online contexts.
         idle_timeout: Seconds before an idle context is closed.
         action_timeout: Total seconds allowed for a tool call, including queueing.
-        data_dir: Plugin-owned directory for explicit login snapshots and temporary files.
+        data_dir: Plugin-owned directory for login snapshots and temporary files.
         tool_level: Cumulative model tool level: basic, standard or full.
     """
 
@@ -190,18 +193,52 @@ class AgentBrowser:
                 and time.monotonic() - session.last_used >= self.idle_timeout
             ]
             for owner in expired:
-                await self._drop(owner, self._sessions[owner])
+                await self._drop(owner, self._sessions[owner], save_state=True)
 
-    async def _drop(self, owner: Owner, session: AgentSession) -> None:
-        if self._sessions.get(owner) is session:
-            del self._sessions[owner]
+    async def _save_on_close(self, owner: Owner, session: AgentSession) -> bool | None:
+        """Best-effort final snapshot; a cleared session must stay cleared."""
         try:
-            await asyncio.wait_for(session.context.close(), timeout=5)
-        except (PlaywrightError, asyncio.TimeoutError):
-            logger.warning("Failed to close an agent browser context", exc_info=True)
+            async with self.storage.lock(owner):
+                if not session.auto_save:
+                    return None
+                saved = await asyncio.wait_for(
+                    session.context.storage_state(indexed_db=True),
+                    timeout=STATE_SAVE_TIMEOUT,
+                )
+                self.storage.write_state(owner, saved)
+            return True
+        except Exception as exc:
+            logger.warning(
+                "Automatic browser login save failed (%s)", type(exc).__name__
+            )
+            return False
+
+    async def _drop(
+        self, owner: Owner, session: AgentSession, *, save_state: bool = False
+    ) -> bool | None:
+        saved = None
+        defer_close = False
+        try:
+            if save_state and self._sessions.get(owner) is session:
+                saved = await self._save_on_close(owner, session)
+        except asyncio.CancelledError:
+            # Shutdown retries an interrupted final save after cancelling active calls.
+            defer_close = self._closed
+            raise
         finally:
-            session.refs.clear()
-            session.snapshots.clear()
+            if not defer_close:
+                if self._sessions.get(owner) is session:
+                    del self._sessions[owner]
+                try:
+                    await asyncio.wait_for(session.context.close(), timeout=5)
+                except (PlaywrightError, asyncio.TimeoutError):
+                    logger.warning(
+                        "Failed to close an agent browser context", exc_info=True
+                    )
+                finally:
+                    session.refs.clear()
+                    session.snapshots.clear()
+        return saved
 
     async def _get_session(
         self, owner: Owner, browser: Browser, *, create: bool
@@ -221,7 +258,7 @@ class AgentBrowser:
                     not session.lock.locked()
                     and time.monotonic() - session.last_used >= self.idle_timeout
                 ):
-                    await self._drop(owner, session)
+                    await self._drop(owner, session, save_state=True)
                     raise AgentBrowserError(
                         "SESSION_EXPIRED", "浏览器会话已空闲过期，请重新打开网址。"
                     )
@@ -235,9 +272,40 @@ class AgentBrowser:
                     "SESSION_LIMIT",
                     "浏览器会话数量已达上限，请关闭不用的会话或稍后重试。",
                 )
-            session = await self._new_session(owner, browser)
+            session = await self._restore_session(owner, browser)
             self._sessions[owner] = session
             return session
+
+    async def _restore_session(
+        self, owner: Owner, browser: Browser, options: dict[str, Any] | None = None
+    ) -> AgentSession:
+        """Load a new session's own snapshot, with a clean fallback on invalid data."""
+        saved = None
+        notice = ""
+        async with self.storage.lock(owner):
+            try:
+                saved = self.storage.read_state(owner)
+            except (AgentBrowserError, OSError) as exc:
+                if (
+                    not isinstance(exc, AgentBrowserError)
+                    or exc.code != "STATE_NOT_FOUND"
+                ):
+                    notice = "已保存的登录状态无法读取，本次会话从空白状态开始。"
+                    logger.warning(
+                        "Automatic browser login restore failed (%s)",
+                        type(exc).__name__,
+                    )
+        try:
+            session = await self._new_session(owner, browser, saved, options)
+        except PlaywrightError:
+            if saved is None:
+                raise
+            session = await self._new_session(owner, browser, options=options)
+            notice = "已保存的登录状态无法载入，本次会话从空白状态开始。"
+            logger.warning("Saved browser login state was rejected by Chromium")
+        if notice:
+            session.notices.append(notice)
+        return session
 
     async def _new_session(
         self,
@@ -640,17 +708,21 @@ class AgentBrowser:
                     "INVALID_ARGUMENT", "operation 为 status/save/restore/clear。"
                 )
             if operation in {"status", "clear"}:
-                async with self.storage.lock(owner):
-                    path = self.storage.state_path(owner)
-                    if operation == "clear":
-                        path.unlink(missing_ok=True)
-                    return BrowserResult(
-                        {
-                            "success": True,
-                            "saved": path.is_file(),
-                            "live_session_unchanged": True,
-                        }
-                    )
+                async with self._registry_lock:
+                    async with self.storage.lock(owner):
+                        path = self.storage.state_path(owner)
+                        if operation == "clear":
+                            path.unlink(missing_ok=True)
+                            session = self._sessions.get(owner)
+                            if session is not None:
+                                session.auto_save = False
+                        return BrowserResult(
+                            {
+                                "success": True,
+                                "saved": path.is_file(),
+                                "live_session_unchanged": True,
+                            }
+                        )
             if operation == "restore":
                 async with self.storage.lock(owner):
                     saved = self.storage.read_state(owner)
@@ -695,7 +767,12 @@ class AgentBrowser:
                 try:
                     return await self._act(owner, session, action, args)
                 except BaseException as exc:
-                    if action == "evaluate" and isinstance(exc, asyncio.CancelledError):
+                    if self._closed:
+                        # Shutdown saves retained contexts after all calls have stopped.
+                        pass
+                    elif action == "evaluate" and isinstance(
+                        exc, asyncio.CancelledError
+                    ):
                         await self._drop(owner, session)
                     else:
                         try:
@@ -720,6 +797,7 @@ class AgentBrowser:
             if previous is None and len(self._sessions) >= self.max_sessions:
                 raise AgentBrowserError("SESSION_LIMIT", "浏览器会话数量已达上限。")
             async with previous.lock if previous else asyncio.Lock():
+                preserve_auto_save = saved is None
                 if previous is not None:
                     if saved is None:
                         if previous.context.browser is not browser:
@@ -730,10 +808,15 @@ class AgentBrowser:
                         saved = await previous.context.storage_state(indexed_db=True)
                     if options is None:
                         options = previous.environment
-                session = await self._new_session(owner, browser, saved, options)
+                if previous is None and saved is None:
+                    session = await self._restore_session(owner, browser, options)
+                else:
+                    session = await self._new_session(owner, browser, saved, options)
                 try:
                     await session.context.new_page()
                     if previous is not None:
+                        if preserve_auto_save:
+                            session.auto_save = previous.auto_save
                         session.interceptor.rules = dict(previous.interceptor.rules)
                         session.network.active = previous.network.active
                         session.network.pattern = previous.network.pattern
@@ -1185,8 +1268,10 @@ class AgentBrowser:
         if action == "emulate":
             return BrowserResult({"success": True, "environment": session.environment})
         if action == "close":
-            await self._drop(owner, session)
-            return BrowserResult({"success": True, "session_closed": True})
+            saved = await self._drop(owner, session, save_state=True)
+            return BrowserResult(
+                {"success": True, "session_closed": True, "state_saved": saved}
+            )
         if action == "tabs":
             operation = args.get("operation", "list")
             tab_id = args.get("tab_id", "")
@@ -1218,14 +1303,18 @@ class AgentBrowser:
                 session.active_tab = tab_id
                 await page.bring_to_front()
             else:
-                await page.close()
-                session.tabs.pop(tab_id, None)
                 remaining = [
-                    key for key, tab in session.tabs.items() if not tab.is_closed()
+                    key
+                    for key, tab in session.tabs.items()
+                    if key != tab_id and not tab.is_closed()
                 ]
                 if not remaining:
-                    await self._drop(owner, session)
-                    return BrowserResult({"success": True, "session_closed": True})
+                    saved = await self._drop(owner, session, save_state=True)
+                    return BrowserResult(
+                        {"success": True, "session_closed": True, "state_saved": saved}
+                    )
+                await page.close()
+                session.tabs.pop(tab_id, None)
                 if session.active_tab == tab_id:
                     session.active_tab = remaining[0]
             return await self._observe(session)
@@ -1249,6 +1338,7 @@ class AgentBrowser:
             async with self.storage.lock(owner):
                 saved = await session.context.storage_state(indexed_db=True)
                 self.storage.write_state(owner, saved)
+                session.auto_save = True
             return BrowserResult({"success": True, "saved": True})
         if action == "upload":
             return await self._upload(owner, session, args)
@@ -1349,20 +1439,19 @@ class AgentBrowser:
                     await target.dispose()
         return await self._observe(session)
 
-    async def close(self) -> None:
-        """Cancel active calls and release the reaper and retained contexts."""
+    async def close(self, *, pending_tasks: Iterable[asyncio.Task[Any]] = ()) -> None:
+        """Stop active calls, save login state and release retained contexts."""
         self._closed = True
         current = asyncio.current_task()
-        tasks = [
-            task for task in self._tasks | self._maintenance if task is not current
-        ]
+        tasks = set(pending_tasks) | self._tasks | self._maintenance
+        tasks.discard(current)
         if self._reaper is not None:
-            tasks.append(self._reaper)
+            tasks.add(self._reaper)
         for task in tasks:
             task.cancel()
         if tasks:
             await asyncio.gather(*tasks, return_exceptions=True)
         async with self._registry_lock:
             for owner, session in list(self._sessions.items()):
-                await self._drop(owner, session)
+                await self._drop(owner, session, save_state=True)
         self.storage.close()

@@ -58,7 +58,7 @@
         "description": "Agent 会话空闲回收时间（秒）",
         "type": "int",
         "default": 600,
-        "hint": "允许 30～3600。空闲到期关闭页面并清除当前会话状态；不会自动保存，不删除通过 browser_state 显式保存的登录快照。"
+        "hint": "允许 30～3600。空闲到期自动保存个人登录快照后关闭会话，下次创建会话时自动恢复；显式 clear 后当前会话不再自动保存。"
       },
       "action_timeout": {
         "description": "Agent 单次工具总超时（秒）",

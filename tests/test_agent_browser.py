@@ -162,11 +162,12 @@ async def site():
         yield f"http://127.0.0.1:{port}", requests
     finally:
         server.close()
-        await server.wait_closed()
+        # Python 3.12+ waits for accepted sockets too, including idle browser sockets.
         for task in list(connections):
             task.cancel()
         if connections:
             await asyncio.gather(*connections, return_exceptions=True)
+        await server.wait_closed()
 
 
 @pytest.fixture
@@ -578,7 +579,7 @@ async def test_precise_wait_hidden_detached_url_load_and_frame(browser_agent, si
     await agent.execute(OWNER, "wait", condition="load", value="load")
 
 
-async def test_login_state_persists_only_on_save_and_restores_storage(
+async def test_explicit_login_state_save_and_restore_preserves_storage(
     browser_agent, site
 ):
     agent = browser_agent
@@ -632,14 +633,181 @@ async def test_login_state_persists_only_on_save_and_restores_storage(
         await replacement.close()
 
 
+@pytest.mark.parametrize("browser_agent", ["basic"], indirect=True)
+@pytest.mark.parametrize("ending", ["close", "last_tab", "idle", "expired", "shutdown"])
+async def test_session_end_saves_once_and_new_session_restores_login(
+    browser_agent, site, monkeypatch, ending
+):
+    agent = browser_agent
+    await agent.execute(OWNER, "open", url=site[0])
+    session = agent._sessions[OWNER]
+    await session.context.add_cookies(
+        [{"name": "login", "value": "alice-secret", "url": site[0]}]
+    )
+    page = session.tabs["tab_1"]
+    await page.evaluate(
+        "localStorage.setItem('account','alice');sessionStorage.setItem('temporary','only-this-tab')"
+    )
+    await page.evaluate("""() => new Promise((resolve,reject) => {
+      const request=indexedDB.open('auth',1);
+      request.onupgradeneeded=()=>request.result.createObjectStore('tokens');
+      request.onerror=()=>reject(request.error);
+      request.onsuccess=()=>{const db=request.result;const tx=db.transaction('tokens','readwrite');
+        tx.objectStore('tokens').put('indexed-secret','token');tx.oncomplete=()=>{db.close();resolve()};};
+    })""")
+    export = AsyncMock(wraps=session.context.storage_state)
+    monkeypatch.setattr(session.context, "storage_state", export)
+    await agent.execute(OWNER, "observe")
+    await agent.execute(OWNER, "open", url=site[0])
+    assert export.await_count == 0
+    assert not agent.storage.state_path(OWNER).exists()
+
+    if ending == "close":
+        assert (await agent.execute(OWNER, "close")).data["state_saved"] is True
+    elif ending == "last_tab":
+        result = await agent.execute(OWNER, "tabs", operation="close", tab_id="tab_1")
+        assert result.data["state_saved"] is True
+    elif ending == "idle":
+        session.last_used -= 1000
+        await agent.reap_idle()
+    elif ending == "expired":
+        session.last_used -= 1000
+        with pytest.raises(AgentBrowserError, match="空闲过期"):
+            await agent.execute(OWNER, "observe")
+    else:
+        await agent.close()
+
+    assert OWNER not in agent._sessions
+    assert page.is_closed()
+    assert agent.storage.read_state(OWNER)["cookies"][0]["value"] == "alice-secret"
+    await agent.close()
+    export.assert_awaited_once_with(indexed_db=True)
+
+    replacement = AgentBrowser(agent.service, data_dir=agent.storage.data_dir)
+    try:
+        await replacement.execute(OTHER, "open", url=site[0])
+        other = replacement._sessions[OTHER]
+        assert await other.context.cookies() == []
+        assert (
+            await other.tabs["tab_1"].evaluate("localStorage.getItem('account')")
+            is None
+        )
+        # Opening is enough to restore, including at the basic tool level.
+        await replacement.execute(OWNER, "open", url=site[0])
+        fresh = replacement._sessions[OWNER]
+        assert (await fresh.context.cookies())[0]["value"] == "alice-secret"
+        restored = fresh.tabs["tab_1"]
+        assert await restored.evaluate("localStorage.getItem('account')") == "alice"
+        assert await restored.evaluate("sessionStorage.getItem('temporary')") is None
+        assert (
+            await restored.evaluate("""() => new Promise(resolve=>{
+          const r=indexedDB.open('auth');r.onsuccess=()=>{const db=r.result;
+            const get=db.transaction('tokens').objectStore('tokens').get('token');
+            get.onsuccess=()=>{resolve(get.result);db.close()};};
+        })""")
+            == "indexed-secret"
+        )
+    finally:
+        await replacement.close()
+
+
+async def test_clear_survives_environment_rebuild_and_close(browser_agent, site):
+    agent = browser_agent
+    await agent.execute(OWNER, "open", url=site[0])
+    await agent._sessions[OWNER].context.add_cookies(
+        [{"name": "login", "value": "alice", "url": site[0]}]
+    )
+    await agent.execute(OWNER, "state", operation="save")
+    await agent.execute(OWNER, "state", operation="clear")
+    await agent.execute(OWNER, "emulate", operation="set", settings={"locale": "zh-CN"})
+    await agent.execute(OWNER, "open", url=site[0])
+    assert (await agent._sessions[OWNER].context.cookies())[0]["value"] == "alice"
+    assert (await agent.execute(OWNER, "close")).data["state_saved"] is None
+    assert not agent.storage.state_path(OWNER).exists()
+
+    await agent.execute(OWNER, "open", url=site[0])
+    assert await agent._sessions[OWNER].context.cookies() == []
+    assert (await agent.execute(OWNER, "close")).data["state_saved"] is True
+
+
+async def test_explicit_save_reenables_auto_save_after_clear(browser_agent, site):
+    agent = browser_agent
+    await agent.execute(OWNER, "open", url=site[0])
+    await agent.execute(OWNER, "state", operation="clear")
+    await agent.execute(OWNER, "state", operation="save")
+    await agent._sessions[OWNER].context.add_cookies(
+        [{"name": "login", "value": "latest", "url": site[0]}]
+    )
+    assert (await agent.execute(OWNER, "close")).data["state_saved"] is True
+    assert agent.storage.read_state(OWNER)["cookies"][0]["value"] == "latest"
+
+
+async def test_starting_with_environment_settings_also_restores_login(
+    browser_agent, site
+):
+    agent = browser_agent
+    await agent.execute(OWNER, "open", url=site[0])
+    await agent._sessions[OWNER].context.add_cookies(
+        [{"name": "login", "value": "alice", "url": site[0]}]
+    )
+    await agent.execute(OWNER, "close")
+    snapshot = agent.storage.state_path(OWNER).read_bytes()
+    await agent.execute(OWNER, "emulate", operation="set", settings={"locale": "zh-CN"})
+    assert (await agent._sessions[OWNER].context.cookies())[0]["value"] == "alice"
+    assert agent._sessions[OWNER].environment["locale"] == "zh-CN"
+    assert agent.storage.state_path(OWNER).read_bytes() == snapshot
+
+
+@pytest.mark.parametrize("snapshot", ["{broken", '{"cookies":[{}],"origins":[]}'])
+async def test_bad_auto_restore_starts_clean_and_reports_notice(
+    browser_agent, site, snapshot
+):
+    agent = browser_agent
+    agent.storage.state_path(OWNER).write_text(snapshot, encoding="utf-8")
+    result = await agent.execute(OWNER, "open", url=site[0])
+    assert result.data["success"]
+    assert any("登录状态无法" in notice for notice in result.data["notices"])
+    assert await agent._sessions[OWNER].context.cookies() == []
+    assert agent.storage.state_path(OWNER).read_text(encoding="utf-8") == snapshot
+
+
+async def test_auto_save_failure_closes_session_and_keeps_previous_snapshot(
+    browser_agent, site, monkeypatch
+):
+    agent = browser_agent
+    await agent.execute(OWNER, "open", url=site[0])
+    await agent.execute(OWNER, "state", operation="save")
+    previous = agent.storage.state_path(OWNER).read_bytes()
+    page = agent._sessions[OWNER].tabs["tab_1"]
+
+    def fail_write(*args):
+        raise OSError("disk full")
+
+    monkeypatch.setattr(agent.storage, "write_state", fail_write)
+    result = await agent.execute(OWNER, "close")
+    assert result.data["success"] and result.data["state_saved"] is False
+    assert OWNER not in agent._sessions
+    assert page.is_closed()
+    assert agent.storage.state_path(OWNER).read_bytes() == previous
+
+
 async def test_restore_replaces_tabs_invalidates_refs_and_preserves_on_corrupt_state(
     browser_agent, site
 ):
     agent = browser_agent
     old = await agent.execute(OWNER, "open", url=site[0])
+    await agent._sessions[OWNER].context.add_cookies(
+        [{"name": "login", "value": "saved", "url": site[0]}]
+    )
     await agent.execute(OWNER, "state", operation="save")
+    snapshot = agent.storage.state_path(OWNER).read_bytes()
     previous = agent._sessions[OWNER]
+    await previous.context.add_cookies(
+        [{"name": "login", "value": "unsaved", "url": site[0]}]
+    )
     await agent.execute(OWNER, "state", operation="restore")
+    assert agent.storage.state_path(OWNER).read_bytes() == snapshot
+    assert (await agent._sessions[OWNER].context.cookies())[0]["value"] == "saved"
     assert all(page.is_closed() for page in previous.context.pages)
     assert agent._sessions[OWNER] is not previous
     with pytest.raises(AgentBrowserError) as error:
@@ -886,12 +1054,13 @@ async def test_screenshot_coordinate_click_and_stale_guard(browser_agent, site):
 async def test_tabs_popup_switch_and_last_tab_close(browser_agent, site):
     agent = browser_agent
     result = await agent.execute(OWNER, "open", url=site[0])
-    result = await agent.execute(
-        OWNER,
-        "click",
-        observation_id=result.data["observation_id"],
-        ref=element(result, "查看详情"),
-    )
+    async with agent._sessions[OWNER].context.expect_page():
+        result = await agent.execute(
+            OWNER,
+            "click",
+            observation_id=result.data["observation_id"],
+            ref=element(result, "查看详情"),
+        )
     tabs = await agent.execute(OWNER, "tabs", operation="list")
     assert len(tabs.data["tabs"]) == 2
     assert tabs.data["active_tab"] == "tab_1"
@@ -990,12 +1159,16 @@ async def test_timeout_and_cancellation_release_locks_and_capacity(
     await agent.execute(OWNER, "observe")
 
 
-async def test_shutdown_cancels_active_calls_and_closes_contexts(
-    browser_agent, site, monkeypatch
+@pytest.mark.parametrize("action", ["wait", "evaluate"])
+async def test_shutdown_cancels_active_calls_saves_login_and_closes_contexts(
+    browser_agent, site, monkeypatch, action
 ):
     agent = browser_agent
-    await agent.execute(OWNER, "open", url=site[0])
+    opened = await agent.execute(OWNER, "open", url=site[0])
     context = agent._sessions[OWNER].context
+    await context.add_cookies(
+        [{"name": "login", "value": "saved-on-shutdown", "url": site[0]}]
+    )
     entered = asyncio.Event()
     original_act = agent._act
 
@@ -1004,16 +1177,25 @@ async def test_shutdown_cancels_active_calls_and_closes_contexts(
         return await original_act(*args)
 
     monkeypatch.setattr(agent, "_act", track_act)
+    arguments = (
+        {"condition": "text", "value": "不会出现的文字"}
+        if action == "wait"
+        else {
+            "observation_id": opened.data["observation_id"],
+            "expression": "() => new Promise(()=>{})",
+        }
+    )
     task = asyncio.create_task(
-        agent.execute(OWNER, "wait", condition="text", value="不会出现的文字")
+        asyncio.wait_for(agent.execute(OWNER, action, **arguments), timeout=30)
     )
     await asyncio.wait_for(entered.wait(), timeout=5)
-    await agent.close()
+    await agent.close(pending_tasks=[task])
     with pytest.raises(asyncio.CancelledError):
         await task
     assert not agent._sessions
     assert context not in agent.service._browser.contexts
     assert agent._reaper.done()
+    assert agent.storage.read_state(OWNER)["cookies"][0]["value"] == "saved-on-shutdown"
 
 
 async def test_browser_restart_reports_lost_session(browser_agent, site):

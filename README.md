@@ -33,7 +33,7 @@ Agent 使用 AstrBot 自身的工具调用循环决定下一步，插件负责�
 | `browser_scroll(observation_id, direction="down", pixels=600)` | 向指定方向滚动，`pixels` 为 1～5000 的整数 |
 | `browser_wait(condition, value, state="", frame_index=0)` | 等待文字、CSS 元素、网址或页面加载状态；文字和元素支持出现/消失 |
 | `browser_tabs(operation="list", tab_id="")` | 列出、切换或关闭标签页，操作为 `list` / `switch` / `close` |
-| `browser_close()` | 关闭个人会话和全部标签页，清除本次登录状态 |
+| `browser_close()` | 自动保存登录快照后关闭个人会话和全部标签页 |
 
 ### 第二层：完整交互
 
@@ -100,7 +100,7 @@ Agent 使用 AstrBot 自身的工具调用循环决定下一步，插件负责�
 - 同一消息来源中的不同发送者拥有独立的 Cookie、存储和页面；模型不能指定或访问其他用户的会话。
 - 会话默认保留至空闲 600 秒，并由周期任务回收。关闭最后一个标签页、调用 `browser_close()` 或卸载插件也会释放会话。
 - 每个会话最多 8 个标签页。网页弹出的标签页会出现在列表中，由模型明确切换。
-- 默认只在运行中的 Context 内保留登录态；只有显式调用 `browser_state(operation="save")` 才会写入磁盘，重启后也需要显式恢复。
+- 会话正常结束前自动保存登录快照，创建新会话时按用户自动恢复；适用于全部工具层级。浏览操作期间不定时保存，也不会每次操作都写盘，仍可通过 `browser_state(operation="save")` 提前保存。
 - Agent 页面启用 JavaScript 并允许 HTTP/HTTPS 请求；网络访问使用 AstrBot 所在主机的网络环境。
 - JavaScript 弹窗按一次性预设规则处理，无匹配规则时自动取消；结果包含 `dialogs` 历史和 `notices`。人工登录接管暂未提供。
 - 失败结果包含 `success=false` 及 `error.code`、`error.message`。元素失效时重新观察；工具超时后操作可能已执行，应先观察确认，避免重复提交。
@@ -139,9 +139,13 @@ browser_wait(condition="load", value="domcontentloaded")
 
 弹窗需要先预设，再触发：例如先调用 `browser_dialog(operation="accept", dialog_type="confirm", message="确认操作")`，再点击页面按钮。`dialog_type` 和 `message` 为空时不限制；填写后必须完全匹配，命中一次就消耗规则，其他弹窗自动取消。`prompt_text` 用于接受 prompt 时输入文字，`clear` 删除尚未使用的规则，`list` 返回待用规则和最近 10 次历史。它不会使网页一直停在弹窗上等待下一轮工具调用。
 
-每个用户有一份独立的登录状态快照，保存 Cookie、Local Storage 和 IndexedDB，不保存标签页、密码输入框或 sessionStorage。`save` 覆盖自己的上次保存；`restore` 关闭现有标签页并创建新会话，随后调用 `browser_open` 访问网站。`clear` 只删除磁盘快照，当前会话仍保留登录；同时清除当前登录需再调用 `browser_close`。
+每个用户有一份独立的登录状态快照，保存 Cookie、Local Storage 和 IndexedDB，不保存标签页、密码输入框或 sessionStorage。调用 `browser_close()`、通过 `browser_tabs` 关闭最后一个标签页、空闲回收和插件正常停止/卸载/重载时，在关闭 Context 前自动保存一次；创建新会话时自动载入自己的快照，无需手动调用 `save` 或 `restore`。自动保存和恢复在 `basic`、`standard`、`full` 层级均生效，浏览操作期间不自动写盘。切换浏览环境或显式恢复快照时的 Context 重建不触发自动保存。
 
-快照保存在 AstrBot 的 `data/plugin_data/astrbot_plugin_browser/login_states/` 中，按身份哈希划分，最多 20 MiB。快照包含登录凭据，以 JSON 存在本机磁盘，请按凭据文件管理该目录。模型只收到保存/恢复结果，不会收到 Cookie 内容或磁盘路径。插件卸载、重启或关闭 BrowserUse 不会删除显式保存的快照，也不会自动恢复。
+`browser_state` 在 `standard/full` 层级提供显式管理：`save` 立即覆盖自己的上次保存，并重新启用当前会话的自动保存；`restore` 关闭现有标签页并载入磁盘快照，随后调用 `browser_open` 访问网站。`clear` 删除磁盘快照并停用当前会话的自动保存，当前页面仍保留登录；环境重建也会延续停用状态，显式 `save` 或创建下一次新会话后恢复自动保存。彻底清除当前登录及其快照可先 `clear` 再 `browser_close()`。
+
+自动保存最多等待 5 秒导出状态，失败会记录日志并继续关闭，已有快照保留；显式关闭会话的返回值 `state_saved` 为 `true`、`false`、`null`，分别表示保存成功、失败、因 `clear` 跳过。自动恢复遇到损坏或不可用的快照时，会创建空白会话并返回提示；显式 `restore` 失败仍保留原会话。浏览器崩溃、断电、强制结束进程等情况无法保证保存最新状态，登录凭据过期后仍需重新登录。
+
+快照保存在 AstrBot 的 `data/plugin_data/astrbot_plugin_browser/login_states/` 中，按身份哈希划分，最多 20 MiB。快照包含登录凭据，以 JSON 存在本机磁盘，请按凭据文件管理该目录。模型只收到保存/恢复结果，不会收到 Cookie 内容或磁盘路径。插件卸载、重启或关闭 BrowserUse 不会删除已保存的快照，下次创建个人会话时自动恢复。
 
 ### 高级：网络监听和请求拦截
 
@@ -471,7 +475,7 @@ async with browser.session(
 | `browser_use.idle_timeout` | `600` 秒 | 30～3600 | Agent 会话空闲回收时间 |
 | `browser_use.action_timeout` | `30` 秒 | 1～120 | 单次 Agent 工具总时限，包括排队、操作和观察 |
 
-保存配置后重载插件生效。关闭 BrowserUse 后，全部 `browser_*` 工具从可用工具列表中移除，工具定义不会发送给模型；缓存的直接调用也会返回 `BROWSER_USE_DISABLED`。重载会关闭原有 Agent 会话并清理个人临时文件，显式保存的登录快照保留。离线渲染服务仍然可用，工具管理中的单项启停设置保持不变。
+保存配置后重载插件生效。关闭 BrowserUse 后，全部 `browser_*` 工具从可用工具列表中移除，工具定义不会发送给模型；缓存的直接调用也会返回 `BROWSER_USE_DISABLED`。重载会自动保存原有 Agent 会话的登录状态后关闭会话，并清理个人临时文件；已保存的登录快照保留。离线渲染服务仍然可用，工具管理中的单项启停设置保持不变。
 
 启用 BrowserUse 时，仅保留所选层级的工具定义；缓存调用更高层级的工具会返回 `TOOL_LEVEL_REQUIRED`，提示所需层级。原 `browser_use.network_enabled`、`intercept_enabled`、`emulation_enabled`、`javascript_enabled` 已移除，统一使用 `browser_use.tool_level`，不提供旧开关别名。若将旧字段直接传入插件，会报未知配置错误；AstrBot 配置加载器可能清理旧字段并补入默认 `basic`，需要高级能力时请在重载后明确选择 `full`。
 

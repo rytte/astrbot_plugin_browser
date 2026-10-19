@@ -119,3 +119,58 @@ async def test_file_and_state_metadata_do_not_require_a_browser(tmp_path):
         assert agent.service._browser is None
     finally:
         await agent.close()
+
+
+async def test_auto_save_timeout_keeps_snapshot_and_does_not_block_shutdown(
+    tmp_path, monkeypatch
+):
+    agent = AgentBrowser(BrowserService(), data_dir=tmp_path)
+    previous = {"cookies": [], "origins": []}
+    agent.storage.write_state(OWNER, previous)
+
+    async def stuck_export(**kwargs):
+        await asyncio.Event().wait()
+
+    context = SimpleNamespace(
+        storage_state=AsyncMock(side_effect=stuck_export), close=AsyncMock()
+    )
+    agent._sessions[OWNER] = AgentSession(context=context, owner=OWNER)
+    monkeypatch.setattr("astrbot_plugin_browser.agent_browser.STATE_SAVE_TIMEOUT", 0.01)
+    await asyncio.wait_for(agent.close(), timeout=1)
+    context.close.assert_awaited_once()
+    assert not agent._sessions
+    assert agent.storage.read_state(OWNER) == previous
+
+
+async def test_shutdown_retries_save_interrupted_during_idle_reaping(tmp_path):
+    agent = AgentBrowser(BrowserService(), data_dir=tmp_path)
+    started = asyncio.Event()
+    latest = {
+        "cookies": [],
+        "origins": [
+            {
+                "origin": "https://example.com",
+                "localStorage": [{"name": "login", "value": "latest"}],
+            }
+        ],
+    }
+    calls = 0
+
+    async def export(**kwargs):
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            started.set()
+            await asyncio.Event().wait()
+        return latest
+
+    context = SimpleNamespace(
+        storage_state=AsyncMock(side_effect=export), close=AsyncMock()
+    )
+    agent._sessions[OWNER] = AgentSession(context=context, owner=OWNER, last_used=0)
+    agent._reaper = asyncio.create_task(agent.reap_idle())
+    await asyncio.wait_for(started.wait(), timeout=1)
+    await asyncio.wait_for(agent.close(), timeout=1)
+    assert agent._reaper.cancelled()
+    context.close.assert_awaited_once()
+    assert agent.storage.read_state(OWNER) == latest

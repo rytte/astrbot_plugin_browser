@@ -1,4 +1,4 @@
-"""Owner-scoped temporary files and explicitly persisted browser login state."""
+"""Owner-scoped temporary files and persisted browser login state."""
 
 from __future__ import annotations
 
