@@ -95,7 +95,9 @@ async def test_auto_install_uses_current_python(monkeypatch):
         communicate=AsyncMock(return_value=(b"installed", b"")),
     )
     create_process = AsyncMock(return_value=process)
-    monkeypatch.setattr(service_module.asyncio, "create_subprocess_exec", create_process)
+    monkeypatch.setattr(
+        service_module.asyncio, "create_subprocess_exec", create_process
+    )
     service = BrowserService()
 
     await service._install_playwright_chromium()
@@ -112,7 +114,9 @@ async def test_auto_install_uses_current_python(monkeypatch):
     process.communicate.assert_awaited_once()
 
 
-async def test_auto_selects_detected_system_browser(fake_runtime, monkeypatch, tmp_path):
+async def test_auto_selects_detected_system_browser(
+    fake_runtime, monkeypatch, tmp_path
+):
     executable = tmp_path / "chrome"
     executable.touch()
     fake_runtime.playwright.chromium.executable_path = str(tmp_path / "missing")
@@ -199,7 +203,7 @@ async def test_session_queue_has_a_bounded_wait(fake_runtime):
     await service.initialize()
 
     async with service.session():
-        with pytest.raises(BrowserServiceError, match="队列已满"):
+        with pytest.raises(BrowserServiceError, match="任务排队超时"):
             async with service.session():
                 pass
 

@@ -1,1 +1,1 @@
-"""Shared local browser service for AstrBot plugins."""
+"""Shared Chromium rendering and multi-turn browser tools for AstrBot agents."""

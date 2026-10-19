@@ -1,26 +1,63 @@
 {
-  "browser_executable": {
-    "description": "浏览器可执行文件路径",
-    "type": "string",
-    "default": "",
-    "hint": "留空自动选择 Playwright Chromium 或本机 Chromium 系浏览器；找不到时会自动安装 Chromium。也可填写本机浏览器的绝对路径，不要加引号。配置的浏览器启动失败时不会自动切换。"
+  "browser": {
+    "description": "浏览器基础设置",
+    "type": "object",
+    "hint": "BrowserUse 和离线渲染共用的浏览器配置。",
+    "items": {
+      "browser_executable": {
+        "description": "浏览器可执行文件路径",
+        "type": "string",
+        "default": "",
+        "hint": "留空自动选择 Playwright Chromium 或本机 Chromium 系浏览器；找不到时会自动安装 Chromium。也可填写本机浏览器的绝对路径，不要加引号。配置的浏览器启动失败时不会自动切换。"
+      },
+      "max_concurrent_sessions": {
+        "description": "最大并发页面任务数",
+        "type": "int",
+        "default": 4,
+        "hint": "允许 1～16。BrowserUse 操作和离线渲染共享执行名额；保留但未执行操作的浏览会话不占名额。"
+      },
+      "queue_timeout": {
+        "description": "任务排队超时（秒）",
+        "type": "int",
+        "default": 30,
+        "hint": "允许 1～300。BrowserUse 操作和离线渲染在执行名额满时，最多等待这些秒数；BrowserUse 同时受单次工具总超时限制。"
+      },
+      "startup_timeout": {
+        "description": "浏览器启动超时（秒）",
+        "type": "int",
+        "default": 30,
+        "hint": "允许 1～120。插件加载时启动并检查共用的 Chromium，BrowserUse 和离线渲染都依赖它。"
+      }
+    }
   },
-  "max_concurrent_sessions": {
-    "description": "最大并发页面会话数",
-    "type": "int",
-    "default": 4,
-    "hint": "允许 1～16。每个任务使用独立浏览器上下文。"
-  },
-  "queue_timeout": {
-    "description": "等待会话队列的超时（秒）",
-    "type": "int",
-    "default": 30,
-    "hint": "允许 1～300。队列超时后调用方会收到明确错误。"
-  },
-  "startup_timeout": {
-    "description": "浏览器启动超时（秒）",
-    "type": "int",
-    "default": 30,
-    "hint": "允许 1～120。插件加载时启动并检查浏览器。"
+  "browser_use": {
+    "description": "BrowserUse",
+    "type": "object",
+    "items": {
+      "enabled": {
+        "description": "启用 BrowserUse 模型工具",
+        "type": "bool",
+        "default": true,
+        "hint": "保存后重载插件生效。关闭时不向模型提供 browser_* 工具，不占用工具定义上下文，也不启动 Agent 会话回收任务；其他插件仍可使用离线渲染服务。"
+      },
+      "max_sessions": {
+        "description": "保留的 Agent 浏览器会话上限",
+        "type": "int",
+        "default": 4,
+        "hint": "允许 1～16。每个消息来源和发送者使用独立的联网浏览器会话；空闲会话不占执行并发名额。"
+      },
+      "idle_timeout": {
+        "description": "Agent 会话空闲回收时间（秒）",
+        "type": "int",
+        "default": 600,
+        "hint": "允许 30～3600。空闲到期关闭页面并清除本次登录状态，不保存到磁盘。"
+      },
+      "action_timeout": {
+        "description": "Agent 单次工具总超时（秒）",
+        "type": "int",
+        "default": 30,
+        "hint": "允许 1～120，包括等待执行名额、页面操作和结果观察。"
+      }
+    }
   }
 }

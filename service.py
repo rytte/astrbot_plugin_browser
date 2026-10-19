@@ -76,7 +76,9 @@ def _system_browser_candidates() -> list[Path]:
             "Vivaldi.app/Contents/MacOS/Vivaldi",
             "Opera.app/Contents/MacOS/Opera",
         )
-        candidates.extend(root / relative for root in app_roots for relative in app_paths)
+        candidates.extend(
+            root / relative for root in app_roots for relative in app_paths
+        )
     else:
         candidates.extend(
             Path(path)
@@ -121,8 +123,8 @@ class BrowserService:
 
     Args:
         browser_executable: Optional absolute path to a Chromium-based browser.
-        max_concurrent_sessions: Maximum number of active isolated contexts.
-        queue_timeout: Maximum time in seconds to wait for a session slot.
+        max_concurrent_sessions: Maximum number of concurrent browser operations.
+        queue_timeout: Maximum time in seconds to wait for an execution slot.
         startup_timeout: Maximum time in seconds allowed for a browser launch.
     """
 
@@ -248,8 +250,7 @@ class BrowserService:
             suffix = f"\n安装输出：{details}" if details else ""
             raise BrowserServiceError(
                 "自动安装 Playwright Chromium 失败，请检查网络和写入权限，或手动运行 "
-                "python -m playwright install chromium。"
-                + suffix
+                "python -m playwright install chromium。" + suffix
             )
 
     async def _ensure_browser(self) -> Browser:
@@ -267,9 +268,9 @@ class BrowserService:
                 if self.browser_executable:
                     launch_options["executable_path"] = self.browser_executable
                 else:
-                    bundled_path = getattr(
-                        self._playwright.chromium, "executable_path", ""
-                    ) or ""
+                    bundled_path = (
+                        getattr(self._playwright.chromium, "executable_path", "") or ""
+                    )
                     bundled_executable = Path(bundled_path)
                     if not bundled_executable.is_file():
                         selected_executable = find_system_chromium()
@@ -324,6 +325,42 @@ class BrowserService:
     @staticmethod
     async def _abort_request(route: Any) -> None:
         await route.abort()
+
+    @asynccontextmanager
+    async def operation(self) -> AsyncIterator[Browser]:
+        """Reserve execution capacity without retaining it between agent turns.
+
+        Yields:
+            The connected shared browser.
+
+        Raises:
+            BrowserServiceError: The service is stopped or capacity is unavailable.
+        """
+        if self._closing or self._closed:
+            raise BrowserServiceError("浏览器服务不可用。")
+        task = asyncio.current_task()
+        registered = task is not None and task not in self._active_tasks
+        if registered:
+            self._active_tasks.add(task)
+        acquired = False
+        try:
+            try:
+                await asyncio.wait_for(
+                    self._semaphore.acquire(), timeout=self.queue_timeout
+                )
+            except asyncio.TimeoutError as exc:
+                raise BrowserServiceError("浏览器任务排队超时，请稍后重试。") from exc
+            acquired = True
+            if self._closing or self._closed:
+                raise BrowserServiceError("浏览器服务不可用。")
+            yield await asyncio.wait_for(
+                self._ensure_browser(), timeout=self._browser_start_timeout
+            )
+        finally:
+            if acquired:
+                self._semaphore.release()
+            if registered:
+                self._active_tasks.discard(task)
 
     @staticmethod
     def _validate_viewport(viewport: dict[str, int] | None) -> dict[str, int]:
@@ -403,52 +440,36 @@ class BrowserService:
         if self._closing or self._closed:
             raise BrowserServiceError("浏览器服务不可用。")
 
-        task = asyncio.current_task()
-        if task is not None:
-            self._active_tasks.add(task)
-        acquired = False
-        context = None
         try:
-            try:
-                await asyncio.wait_for(
-                    self._semaphore.acquire(), timeout=self.queue_timeout
-                )
-            except asyncio.TimeoutError as exc:
-                raise BrowserServiceError("浏览器会话队列已满，请稍后重试。") from exc
-            acquired = True
-            if self._closing or self._closed:
-                raise BrowserServiceError("浏览器服务不可用。")
-            browser = await asyncio.wait_for(
-                self._ensure_browser(), timeout=self._browser_start_timeout
-            )
-            context = await browser.new_context(
-                viewport=viewport,
-                device_scale_factor=float(device_scale_factor),
-                java_script_enabled=javascript_enabled,
-                service_workers="block",
-            )
-            await context.route("**/*", self._abort_request)
-            page = await context.new_page()
-            timeout_ms = int(timeout * 1000)
-            page.set_default_timeout(timeout_ms)
-            page.set_default_navigation_timeout(timeout_ms)
-            yield page
+            async with self.operation() as browser:
+                context = None
+                try:
+                    context = await browser.new_context(
+                        viewport=viewport,
+                        device_scale_factor=float(device_scale_factor),
+                        java_script_enabled=javascript_enabled,
+                        service_workers="block",
+                    )
+                    await context.route("**/*", self._abort_request)
+                    page = await context.new_page()
+                    timeout_ms = int(timeout * 1000)
+                    page.set_default_timeout(timeout_ms)
+                    page.set_default_navigation_timeout(timeout_ms)
+                    yield page
+                finally:
+                    if context is not None:
+                        try:
+                            await asyncio.wait_for(context.close(), timeout=5)
+                        except asyncio.CancelledError:
+                            with suppress(Exception):
+                                await asyncio.shield(context.close())
+                            raise
+                        except Exception:
+                            logger.warning(
+                                "Failed to close a browser context", exc_info=True
+                            )
         except asyncio.TimeoutError as exc:
             raise BrowserServiceError("浏览器启动或创建页面超时。") from exc
-        finally:
-            if context is not None:
-                try:
-                    await asyncio.wait_for(context.close(), timeout=5)
-                except asyncio.CancelledError:
-                    with suppress(Exception):
-                        await asyncio.shield(context.close())
-                    raise
-                except Exception:
-                    logger.warning("Failed to close a browser context", exc_info=True)
-            if acquired:
-                self._semaphore.release()
-            if task is not None:
-                self._active_tasks.discard(task)
 
     async def render_html(
         self,
