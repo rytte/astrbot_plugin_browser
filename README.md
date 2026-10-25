@@ -4,7 +4,7 @@
 
 `astrbot_plugin_browser` 提供 **23 个 BrowserUse 模型工具**，覆盖网页阅读、鼠标与表单操作、文件上传下载、登录状态保存和高级控制；同时提供 **HTML → PNG / PDF** 接口，让 Markdown 渲染、网页卡片和报告导出等插件共用浏览器。
 
-[功能亮点](#features) · [快速开始](#quick-start) · [能力概览](#capabilities) · [常用配置](#configuration) · [技术原理与配置](./docs/技术原理与配置.md) · [开发接入](./docs/技术原理与配置.md#integration)
+[功能亮点](#features) · [快速开始](#quick-start) · [能力概览](#capabilities) · [常用配置](#configuration) · [BrowserUse 文档](./docs/BrowserUse.md) · [共享浏览器文档](./docs/共享浏览器.md) · [开发接入](./docs/共享浏览器.md#integration)
 
 <a id="features"></a>
 
@@ -34,56 +34,9 @@
 | 自定义页面操作 | 获取临时页面，自行测量内容、分页或控制截图细节 |
 | 资源管理 | 共用执行并发与排队限制，可选空闲关闭，下次调用自动启动 |
 
-默认使用无头浏览器，不显示窗口。联网浏览会话与离线渲染任务分别隔离，渲染完成后释放临时页面。[其他插件接入参考](./docs/技术原理与配置.md#integration)
+默认使用无头浏览器，不显示窗口。联网浏览会话与离线渲染任务分别隔离，渲染完成后释放临时页面。[其他插件接入参考](./docs/共享浏览器.md#integration)
 
 <a id="quick-start"></a>
-
-## ✨ 为什么需要它
-
-### 一个浏览器，多个插件共享
-
-浏览器是比较占资源的组件。如果 Markdown 渲染、网页卡片、报告导出等插件各自启动一套 Chromium，很快就会出现多个浏览器进程、重复的 Playwright 驱动和重复的缓存。
-
-默认只维护一个共享的无头 Chromium 实例；额外的有头实例仅在明确请求后存在：
-
-```text
-AstrBot
-  ├─ Markdown 渲染插件 ─┐
-  ├─ 报告导出插件      ─┼─> 共享 Browser(Chromium) ─> 独立 BrowserContext
-  └─ 网页卡片插件      ─┘
-```
-
-这样可以减少重复的浏览器进程和基础开销，通常比每个插件各自启动浏览器更省内存。`browser.max_concurrent_sessions` 还可以限制同时运行的页面任务数量，避免并发渲染把内存一次性推高。
-
-共享不等于没有成本：Chromium 本身仍然需要内存，每个并发页面也会占用额外资源。插件通过任务排队、超时和像素上限把这笔开销控制在可预期范围内。
-
-#### 浏览器内存结构示例
-
-```bash
-Chromium（浏览器实例）									# 150～300 MB
-└── BrowserContext（独立会话：Cookie、登录状态、缓存等）  # 10～60 MB
-    ├── Page（标签页）								 # 10～80 MB
-    └── Page（标签页）								 # 10～80 MB
-```
-
-### 会话与渲染任务相互隔离
-
-每个 Agent 使用者及每个离线渲染任务使用独立的 BrowserContext。不同上下文之间不共享 Cookie、Local Storage 和页面状态；同一 Agent 会话内部保留状态，便于连续操作。
-
-### HTML 截图和 PDF 一套接口
-
-- HTML 渲染为 PNG 字节，可直接交给 `Image.fromBytes()`。
-- HTML 渲染为 PDF 字节，可直接保存或交给文件消息组件。
-- 支持完整 CSS、字体等待、元素选择器截图和整页截图。
-
-### 离线渲染接口
-
-- 浏览器使用无头模式运行。
-- `render_html()`、`render_pdf()` 和 `session()` 默认禁用 JavaScript。
-- 这些渲染接口的页面请求全部拦截，不访问外部网站、外部图片或本地文件。
-- Agent 工具使用独立的联网会话，不改变渲染接口的离线约定。
-
-如果业务确实需要脚本，可以只对单个 `session()` 调用设置 `javascript_enabled=True`。这不会改变其他任务的默认设置。
 
 ## ⚡ 快速开始
 
@@ -153,7 +106,7 @@ python -m pip install -r data/plugins/astrbot_plugin_browser/requirements.txt
 
 <a id="capabilities"></a>
 
-## 🧬 能力概览
+## 🧬 BrowserUse 网页操作
 
 ### 工具层级
 
@@ -165,7 +118,7 @@ python -m pip install -r data/plugins/astrbot_plugin_browser/requirements.txt
 | `standard` | 完整交互 | 19 | 增加拖拽、上传下载、结构化提取、弹窗和登录状态管理 |
 | `full` | 高级控制 | 23 | 增加网络监听、请求拦截、设备模拟和 JavaScript 执行 |
 
-登录状态的自动保存与恢复在三个层级均可用。完整工具清单与参数见 [BrowserUse 工具](./docs/技术原理与配置.md#tools)。
+登录状态的自动保存与恢复在三个层级均可用。完整工具清单与参数见 [BrowserUse 工具](./docs/BrowserUse.md#tools)。
 
 ### 谁可以使用
 
@@ -173,7 +126,7 @@ python -m pip install -r data/plugins/astrbot_plugin_browser/requirements.txt
 
 不同聊天来源和发送者的页面、文件与登录快照分别隔离。同一个人在不同聊天中的会话也相互独立。授权只匹配发送者 ID，多平台使用时，相同发送者 ID 会命中同一白名单条目。
 
-BrowserUse 使用 AstrBot 所在主机的网络和网站登录状态，请仅向可信用户授权。供其他插件调用的离线渲染接口不受个人白名单限制。详见 [权限与会话隔离](./docs/技术原理与配置.md#permissions)。
+BrowserUse 使用 AstrBot 所在主机的网络和网站登录状态，请仅向可信用户授权。供其他插件调用的离线渲染接口不受个人白名单限制。详见 [权限与会话隔离](./docs/BrowserUse.md#permissions)。
 
 ### 有头浏览与登录保存
 
@@ -181,21 +134,70 @@ BrowserUse 使用 AstrBot 所在主机的网络和网站登录状态，请仅向
 
 正常结束会话、通过工具关闭最后一个标签页、空闲回收或正常停止插件时，会尝试保存登录状态，下次创建同一身份的会话时自动恢复。浏览期间不会每次操作都写盘。浏览器崩溃或强制结束进程时，无法保证保存最新状态。
 
-有头与无头之间切换会保留登录存储并重建页面，需要重新打开网址。详细行为见 [有头模式与人工操作](./docs/技术原理与配置.md#headed) 和 [登录状态与文件](./docs/技术原理与配置.md#storage)。
+有头与无头之间切换会保留登录存储并重建页面，需要重新打开网址。详细行为见 [有头模式与人工操作](./docs/BrowserUse.md#headed) 和 [登录状态与文件](./docs/BrowserUse.md#storage)。
+
+## 🧬 共享渲染服务
+
+### 一个浏览器，多个插件共享
+
+浏览器是比较占资源的组件。如果 Markdown 渲染、网页卡片、报告导出等插件各自启动一套 Chromium，很快就会出现多个浏览器进程、重复的 Playwright 驱动和重复的缓存。
+
+默认只维护一个共享的无头 Chromium 实例；额外的有头实例仅在明确请求后存在：
+
+```text
+AstrBot
+  ├─ Markdown 渲染插件 ─┐
+  ├─ 报告导出插件      ─┼─> 共享 Browser(Chromium) ─> 独立 BrowserContext
+  └─ 网页卡片插件      ─┘
+```
+
+这样可以减少重复的浏览器进程和基础开销，通常比每个插件各自启动浏览器更省内存。`browser.max_concurrent_sessions` 还可以限制同时运行的页面任务数量，避免并发渲染把内存一次性推高。
+
+共享不等于没有成本：Chromium 本身仍然需要内存，每个并发页面也会占用额外资源。插件通过任务排队、超时和像素上限把这笔开销控制在可预期范围内。
+
+#### 浏览器内存结构示例
+
+```bash
+Chromium（浏览器实例）									# 150～300 MB
+└── BrowserContext（独立会话：Cookie、登录状态、缓存等）  # 10～60 MB
+    ├── Page（标签页）								 # 10～80 MB
+    └── Page（标签页）								 # 10～80 MB
+```
+
+### 会话与渲染任务相互隔离
+
+每个 Agent 使用者及每个离线渲染任务使用独立的 BrowserContext。不同上下文之间不共享 Cookie、Local Storage 和页面状态；同一 Agent 会话内部保留状态，便于连续操作。
+
+### HTML 截图和 PDF 一套接口
+
+- HTML 渲染为 PNG 字节，可直接交给 `Image.fromBytes()`。
+- HTML 渲染为 PDF 字节，可直接保存或交给文件消息组件。
+- 支持完整 CSS、字体等待、元素选择器截图和整页截图。
+
+### 离线渲染接口
+
+- 浏览器使用无头模式运行。
+- `render_html()`、`render_pdf()` 和 `session()` 默认禁用 JavaScript。
+- 这些渲染接口的页面请求全部拦截，不访问外部网站、外部图片或本地文件。
+- Agent 工具使用独立的联网会话，不改变渲染接口的离线约定。
+
+如果业务确实需要脚本，可以只对单个 `session()` 调用设置 `javascript_enabled=True`。这不会改变其他任务的默认设置。
 
 ### 其他插件如何接入
 
-通过 AstrBot 的插件上下文获取已注册的 `service`，再调用以下接口：
+通过 AstrBot 的插件上下文获取已注册的受限 `service`，再调用以下接口。生命周期控制和底层 Playwright 对象不会作为插件间接口暴露：
 
 | 接口 | 返回或提供的内容 |
 | --- | --- |
 | `render_html()` | PNG 图片字节，可交给 AstrBot 的图片消息组件 |
 | `render_pdf()` | PDF 字节，可保存或交给文件消息组件 |
-| `session()` | 自动清理的临时页面，供调用方自定义操作 |
+| `session()` | 自动清理的受限页面，供调用方排版、测量和截图 |
 
-渲染接口拦截页面的外部资源请求，HTML 中的 CSS、图片和字体应内联。开启空闲关闭后，这些接口会自动唤醒浏览器，已有接入方式保持兼容。
+`session()` 返回 `RenderPage`，`locator()` 返回 `RenderLocator`；它们只公开必要的渲染方法，不提供原生 Page、Context 或 Browser 的关联访问，也不接受本机文件路径。支持操作超时、截图质量与裁剪、元素链式定位等常用渲染能力；需要文件时由调用方保存返回的字节。依赖原生 Playwright 对象的调用需要调整。
 
-完整示例和参数见 [其他插件接入](./docs/技术原理与配置.md#integration)。
+渲染接口拦截页面的外部资源请求，HTML 中的 CSS、图片和字体应内联。开启空闲关闭后，这些接口会自动唤醒浏览器。
+
+完整示例和参数见 [其他插件接入](./docs/共享浏览器.md#integration)。
 
 <a id="configuration"></a>
 
@@ -216,7 +218,7 @@ BrowserUse 使用 AstrBot 所在主机的网络和网站登录状态，请仅向
 
 **会话回收与实例关闭分别计时。** 只有没有保留的无头会话、执行中或排队的无头任务时，才开始实例空闲计时。例如会话回收设为 600 秒、实例超时设为 1200 秒，最后一次操作后约 1800 秒释放无头实例。
 
-完整字段、范围、旧版配置说明与资源生命周期见 [技术原理与配置](./docs/技术原理与配置.md#configuration)。
+共用实例的字段、范围与资源生命周期见[共享浏览器配置](./docs/共享浏览器.md#configuration)，模型工具专用设置见[BrowserUse 配置](./docs/BrowserUse.md#configuration)。
 
 <a id="faq"></a>
 
@@ -230,10 +232,14 @@ BrowserUse 使用 AstrBot 所在主机的网络和网站登录状态，请仅向
 | 模型无法查看截图 | 使用支持图片输入的模型，并在 AstrBot 提供商配置中启用 `image` 能力 |
 | 渲染缺少图片或字体 | 离线渲染不加载外部资源，请将资源内联到 HTML 中 |
 
-浏览器安装、超时排队和登录恢复的处理方式见 [故障排查](./docs/技术原理与配置.md#faq)。
+浏览器安装与排队超时见[共享浏览器故障排查](./docs/共享浏览器.md#faq)，工具权限与登录恢复见[BrowserUse 故障排查](./docs/BrowserUse.md#faq)。
 
 ## 🤝 反馈与贡献
 
 遇到问题或有改进建议，欢迎提交 [Issue](https://github.com/rytte/astrbot_plugin_browser/issues)；想一起完善功能，也欢迎提交 [Pull Request](https://github.com/rytte/astrbot_plugin_browser/pulls)。
 
-开发环境与验证方式见 [开发验证](./docs/技术原理与配置.md#development)。
+开发环境与验证方式见 [开发验证](./docs/共享浏览器.md#development)。
+
+## 📄 开源协议
+
+本项目采用 GNU Affero General Public License v3.0（`AGPL-3.0`），详见 [LICENSE](./LICENSE)。

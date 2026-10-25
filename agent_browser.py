@@ -846,7 +846,7 @@ class AgentBrowser:
                     raise AgentBrowserError("SESSION_LIMIT", "浏览器会话数量已达上限。")
                 self._headed_owner = owner
         try:
-            async with self.service.operation(target) as browser:
+            async with self.service._operation(target) as browser:
                 return await self._replace_session(owner, browser, mode=target)
         except BaseException:
             if target == "headed" and self._sessions.get(owner) is previous:
@@ -909,7 +909,7 @@ class AgentBrowser:
                 )
             if operation in {"set", "reset"}:
                 options = environment(settings if operation == "set" else {})
-                async with self.service.operation(mode) as browser:
+                async with self.service._operation(mode) as browser:
                     return await self._replace_session(owner, browser, options=options)
         if action == "download":
             return await self._files(owner, args)
@@ -944,7 +944,7 @@ class AgentBrowser:
             if operation == "restore":
                 async with self.storage.lock(owner):
                     saved = self.storage.read_state(owner)
-                async with self.service.operation(mode) as browser:
+                async with self.service._operation(mode) as browser:
                     result = await self._replace_session(owner, browser, saved=saved)
                     result.data["restored"] = True
                     return result
@@ -979,7 +979,7 @@ class AgentBrowser:
             raise AgentBrowserError(
                 "NO_SESSION", "当前没有浏览器会话，请先调用 browser_open。"
             )
-        async with self.service.operation(mode) as browser:
+        async with self.service._operation(mode) as browser:
             session = await self._get_session(
                 owner,
                 browser,

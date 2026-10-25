@@ -14,6 +14,7 @@ from astrbot.api.star import Context, Star, StarTools
 from mcp.types import CallToolResult, ImageContent, TextContent
 
 from .agent_browser import AgentBrowser, AgentBrowserError
+from .render_api import BrowserServiceAPI
 from .service import BrowserService, BrowserServiceError
 
 
@@ -75,7 +76,7 @@ class BrowserPlugin(Star):
                 "browser_use.user_whitelist 必须是非空个人用户 ID 组成的字符串列表。"
             )
         self.user_whitelist = frozenset(user_id.strip() for user_id in user_whitelist)
-        self.service = BrowserService(
+        self._service = BrowserService(
             browser_executable=browser.get("browser_executable", ""),
             max_concurrent_sessions=browser.get("max_concurrent_sessions", 4),
             queue_timeout=browser.get("queue_timeout", 30),
@@ -83,8 +84,9 @@ class BrowserPlugin(Star):
             idle_shutdown_enabled=browser.get("idle_shutdown_enabled", False),
             idle_shutdown_timeout=browser.get("idle_shutdown_timeout", 1200),
         )
+        self.service = BrowserServiceAPI(self._service)
         self.agent = AgentBrowser(
-            self.service,
+            self._service,
             max_sessions=browser_use.get("max_sessions", 4),
             idle_timeout=browser_use.get("idle_timeout", 600),
             action_timeout=browser_use.get("action_timeout", 30),
@@ -105,7 +107,7 @@ class BrowserPlugin(Star):
                 not self.browser_use_enabled or tool.name not in allowed
             ):
                 manager.remove_func(tool.name)
-        await self.service.initialize()
+        await self._service.initialize()
         if self.browser_use_enabled:
             self.agent.start()
         self.logger.info("Shared browser service is ready")
@@ -115,7 +117,7 @@ class BrowserPlugin(Star):
         try:
             await self.agent.close(pending_tasks=self._tool_tasks)
         finally:
-            await self.service.close()
+            await self._service.close()
 
     async def _tool(
         self, event: AstrMessageEvent, action: str, **arguments

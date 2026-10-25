@@ -470,7 +470,7 @@ class BrowserService:
         await route.abort()
 
     @asynccontextmanager
-    async def operation(self, mode: str = "headless") -> AsyncIterator[Browser]:
+    async def _operation(self, mode: str = "headless") -> AsyncIterator[Browser]:
         """Reserve execution capacity without retaining it between agent turns.
 
         Args:
@@ -593,7 +593,7 @@ class BrowserService:
             raise BrowserServiceError("浏览器服务不可用。")
 
         try:
-            async with self.operation() as browser:
+            async with self._operation() as browser:
                 context = None
                 try:
                     context = await browser.new_context(

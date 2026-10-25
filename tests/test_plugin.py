@@ -64,11 +64,15 @@ def test_plugin_owns_one_configured_service():
         },
     )
 
-    assert plugin.service.max_concurrent_sessions == 3
-    assert plugin.service.queue_timeout == 20
-    assert plugin.service.startup_timeout == 15
-    assert plugin.service.idle_shutdown_enabled is True
-    assert plugin.service.idle_shutdown_timeout == 2400
+    assert plugin._service.max_concurrent_sessions == 3
+    assert plugin._service.queue_timeout == 20
+    assert plugin._service.startup_timeout == 15
+    assert plugin._service.idle_shutdown_enabled is True
+    assert plugin._service.idle_shutdown_timeout == 2400
+    assert plugin.service.ready is plugin._service.ready
+    assert not hasattr(plugin.service, "operation")
+    assert not hasattr(plugin.service, "initialize")
+    assert not hasattr(plugin.service, "close")
 
 
 def test_plugin_rejects_unknown_settings():
@@ -174,8 +178,8 @@ def test_schema_loads_both_configuration_groups(tmp_path):
     plugin = BrowserPlugin(SimpleNamespace(), config)
     assert plugin.browser_use_enabled is True
     assert plugin.agent.tool_level == "basic"
-    assert plugin.service.idle_shutdown_enabled is False
-    assert plugin.service.idle_shutdown_timeout == 1200
+    assert plugin._service.idle_shutdown_enabled is False
+    assert plugin._service.idle_shutdown_timeout == 1200
     assert schema["browser"]["items"]["idle_shutdown_timeout"]["condition"] == {
         "idle_shutdown_enabled": True
     }
@@ -225,8 +229,8 @@ async def test_disabled_browser_use_removes_tool_definitions(tool_manager, level
     # AstrBot binds decorator handlers and activation flags before initialize().
     for tool in tool_manager.func_list[:-1]:
         tool.handler = partial(tool.handler, plugin)
-    plugin.service.initialize = AsyncMock()
-    plugin.service.close = AsyncMock()
+    plugin._service.initialize = AsyncMock()
+    plugin._service.close = AsyncMock()
     plugin.agent.execute = AsyncMock()
     try:
         await plugin.initialize()
@@ -241,18 +245,18 @@ async def test_disabled_browser_use_removes_tool_definitions(tool_manager, level
             "BROWSER_USE_DISABLED"
         )
         plugin.agent.execute.assert_not_awaited()
-        plugin.service.initialize.assert_awaited_once()
+        plugin._service.initialize.assert_awaited_once()
     finally:
         await plugin.terminate()
-    plugin.service.close.assert_awaited_once()
+    plugin._service.close.assert_awaited_once()
 
 
 async def test_enabled_browser_use_preserves_tool_activation(tool_manager):
     tool_manager.get_func("browser_open").active = False
     context = SimpleNamespace(get_llm_tool_manager=lambda: tool_manager)
     plugin = BrowserPlugin(context, {"browser_use": {"enabled": True}})
-    plugin.service.initialize = AsyncMock()
-    plugin.service.close = AsyncMock()
+    plugin._service.initialize = AsyncMock()
+    plugin._service.close = AsyncMock()
     try:
         await plugin.initialize()
         assert plugin.agent._reaper is not None
@@ -272,14 +276,14 @@ async def test_plugin_lifecycle_delegates_to_service(tool_manager):
     plugin = BrowserPlugin(
         SimpleNamespace(get_llm_tool_manager=lambda: tool_manager), {}
     )
-    plugin.service.initialize = AsyncMock()
-    plugin.service.close = AsyncMock()
+    plugin._service.initialize = AsyncMock()
+    plugin._service.close = AsyncMock()
 
     await plugin.initialize()
     await plugin.terminate()
 
-    plugin.service.initialize.assert_awaited_once()
-    plugin.service.close.assert_awaited_once()
+    plugin._service.initialize.assert_awaited_once()
+    plugin._service.close.assert_awaited_once()
 
 
 def event(sender="alice", origin="test:group:one", *, admin=True):
@@ -341,7 +345,7 @@ async def test_unauthorized_sender_cannot_access_any_browser_tool(name):
     current.send.assert_not_awaited()
     assert not plugin.agent._sessions and not plugin.agent.storage.files
     assert plugin.agent.storage.read_state(owner) == snapshot
-    assert plugin.service._browser is None and plugin.service._headed_browser is None
+    assert plugin._service._browser is None and plugin._service._headed_browser is None
     assert not plugin._tool_tasks
 
 
@@ -683,7 +687,7 @@ async def test_upload_imports_direct_chat_attachments_and_deduplicates(tmp_path)
             json.loads((await plugin.browser_upload(stranger)).content[0].text)["files"]
             == []
         )
-        assert plugin.service._browser is None
+        assert plugin._service._browser is None
     finally:
         paths = [
             f.path
@@ -783,8 +787,8 @@ async def test_tool_levels_expose_exact_definitions_without_changing_other_plugi
     tool_manager.func_list.append(other)
     context = SimpleNamespace(get_llm_tool_manager=lambda: tool_manager)
     plugin = BrowserPlugin(context, {"browser_use": {"tool_level": level}})
-    plugin.service.initialize = AsyncMock()
-    plugin.service.close = AsyncMock()
+    plugin._service.initialize = AsyncMock()
+    plugin._service.close = AsyncMock()
     try:
         await plugin.initialize()
         names = {tool.name for tool in tool_manager.func_list}
@@ -803,8 +807,8 @@ async def test_enabling_all_advanced_tools_exposes_23_and_preserves_activation(
 ):
     context = SimpleNamespace(get_llm_tool_manager=lambda: tool_manager)
     plugin = BrowserPlugin(context, {"browser_use": {"tool_level": "full"}})
-    plugin.service.initialize = AsyncMock()
-    plugin.service.close = AsyncMock()
+    plugin._service.initialize = AsyncMock()
+    plugin._service.close = AsyncMock()
     tool_manager.get_func("browser_evaluate").active = False
     try:
         await plugin.initialize()

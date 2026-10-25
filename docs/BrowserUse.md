@@ -1,23 +1,12 @@
-# 技术原理与配置
+# BrowserUse：配置与使用原理
 
-本文记录完整配置、BrowserUse 工具契约、浏览器生命周期和插件接入接口。安装与日常使用可先阅读 [项目首页](../README.md)。
+BrowserUse 向模型提供联网网页操作工具。本文说明权限、个人会话、登录状态、工具契约及故障处理；安装步骤见[项目首页](../README.md)。共用 Chromium 的配置、生命周期和供其他插件使用的渲染接口见[共享浏览器](./共享浏览器.md)。
 
-[配置参考](#configuration) · [权限与隔离](#permissions) · [生命周期](#lifecycle) · [工具清单](#tools) · [页面操作](#observations) · [有头模式](#headed) · [登录与文件](#storage) · [高级控制](#advanced) · [开发接入](#integration) · [故障排查](#faq) · [开发验证](#development)
+[配置参考](#configuration) · [权限与隔离](#permissions) · [会话生命周期](#lifecycle) · [工具清单](#tools) · [页面操作](#observations) · [有头模式](#headed) · [登录与文件](#storage) · [高级控制](#advanced) · [边界与错误](#boundaries) · [故障排查](#faq) · [开发验证](#development)
 
 <a id="configuration"></a>
 
 ## 💠 配置参考
-
-插件配置分为两组。**浏览器基础设置**（`browser`）由 BrowserUse 和离线渲染共用：
-
-| 配置项 | 默认值 | 范围 | 说明 |
-|---|---:|---:|---|
-| `browser.browser_executable` | 空 | 绝对路径 | 留空自动选择 Playwright Chromium 或本机 Chromium 系浏览器；也可以填写已有浏览器的绝对路径，不要加引号 |
-| `browser.max_concurrent_sessions` | `4` | 1～16 | 离线渲染与 BrowserUse 操作共享的执行并发；空闲会话不占执行名额 |
-| `browser.queue_timeout` | `30` 秒 | 1～300 | 任务排队超时；执行名额满时等待的最长时间 |
-| `browser.startup_timeout` | `30` 秒 | 1～120 | 启动共用 Chromium 的最长时间 |
-| `browser.idle_shutdown_enabled` | `false` | 布尔值 | 无头实例空闲时关闭，下次浏览或渲染请求自动启动 |
-| `browser.idle_shutdown_timeout` | `1200` 秒 | 30～86400 | 开启空闲关闭后显示；无头实例无任务和保留 Context 后的等待时间 |
 
 **BrowserUse**（`browser_use`）组只放 Agent 网页工具的专用配置：
 
@@ -33,11 +22,13 @@
 
 保存配置后重载插件生效。关闭 BrowserUse 后，全部 `browser_*` 工具从可用工具列表中移除，工具定义不会发送给模型；缓存的直接调用也会返回 `BROWSER_USE_DISABLED`。重载会自动保存原有 Agent 会话的登录状态后关闭会话，并清理个人临时文件；已保存的登录快照保留。离线渲染服务仍然可用，工具管理中的单项启停设置保持不变。
 
+浏览器路径、执行并发、排队、启动及实例空闲关闭属于共用的 `browser` 组，见[共享浏览器配置](./共享浏览器.md#configuration)。
+
 ### 工具层级与旧版配置
 
 启用 BrowserUse 时，仅保留所选层级的工具定义；缓存调用更高层级的工具会返回 `TOOL_LEVEL_REQUIRED`，提示所需层级。原 `browser_use.network_enabled`、`intercept_enabled`、`emulation_enabled`、`javascript_enabled` 已移除，统一使用 `browser_use.tool_level`，不提供旧开关别名。若将旧字段直接传入插件，会报未知配置错误；AstrBot 配置加载器可能清理旧字段并补入默认 `basic`，需要高级能力时请在重载后明确选择 `full`。
 
-原顶层浏览器路径、并发、排队和启动超时配置已移入 `browser` 组；原顶层 `max_agent_sessions`、`agent_idle_timeout`、`agent_action_timeout` 已移入 `browser_use` 组并更名。手动配置请使用表中的新路径，不提供旧字段别名；若将旧字段直接传入插件，会报未知配置错误。AstrBot 配置加载器可能按新 schema 清理旧字段并补入默认值，升级前请记录旧值，再在新组中重新设置。
+原顶层 `max_agent_sessions`、`agent_idle_timeout`、`agent_action_timeout` 已移入 `browser_use` 组并更名，不提供旧字段别名。直接传入旧字段会报未知配置错误；AstrBot 配置加载器可能清理旧字段并补默认值，升级前请记录旧值，再在新组中重新设置。
 
 <a id="permissions"></a>
 
@@ -53,15 +44,9 @@
 
 <a id="lifecycle"></a>
 
-## 🧩 浏览器运行与生命周期
+## 🧩 会话生命周期
 
-### 实例与上下文
-
-`BrowserService` 管理一个共享无头 Chromium、一个按需启动的有头 Chromium，以及共享的 Playwright 驱动。BrowserUse 和离线渲染复用无头实例，明确请求有头模式时才额外启动窗口。
-
-每个 Agent 身份和每个离线渲染任务使用独立的 `BrowserContext`，不同上下文不共享 Cookie、Local Storage 和页面状态。Agent Context 跨多轮保留；渲染 Context 在 `session()` 退出时关闭。
-
-使用普通 Context 配合 `storage_state` 快照保存登录状态，不使用 persistent context 或共享浏览器用户目录。有头模式也由插件创建独立实例，不通过 CDP 接管本机已有的 Chrome。
+BrowserUse 与离线渲染复用无头 Chromium，明确请求有头模式时才额外启动窗口。每个 Agent 身份有独立的 BrowserContext，跨多轮保留；登录状态不与其他身份或渲染 Context 共享。使用普通 Context 配合 `storage_state` 快照，不使用 persistent context 或共享用户目录，也不通过 CDP 接管本机已有的 Chrome。
 
 ### 执行并发与保留会话
 
@@ -75,29 +60,9 @@
 
 会话空闲达到 `browser_use.idle_timeout` 后由周期任务回收，默认 600 秒。显式调用 `browser_close()`、通过工具关闭最后一个标签页、插件正常停止或重载，也会结束会话。
 
-正常结束时先尝试保存登录快照，再关闭 Context。有头会话结束后同时释放有头实例；无头实例由下述空闲关闭开关决定是否继续驻留。会话保存、恢复和 `clear` 的行为见 [登录状态与文件](#storage)。
+正常结束时先尝试保存登录快照，再关闭 Context。有头会话结束后同时释放有头实例；无头实例由[共享浏览器的空闲关闭设置](./共享浏览器.md#lifecycle)决定是否继续驻留。会话保存、恢复和 `clear` 的行为见 [登录状态与文件](#storage)。
 
-### 无头实例空闲关闭
-
-默认 `browser.idle_shutdown_enabled=false`，无头实例保持运行。开启后，WebUI 展示 `browser.idle_shutdown_timeout`，默认 1200 秒，允许 30～86400 秒。
-
-以下条件全部满足时才计算实例空闲时间：
-
-- 没有执行中或排队的无头任务，包含 BrowserUse、HTML/PDF 渲染和底层 `session()`。
-- 没有保留的无头 Context；仍保留页面的 Agent 会话会阻止关闭。
-- 服务未在停止，且实例空闲已达到设定时间。
-
-任务完成和 Context 关闭都会刷新计时。后台最多每 30 秒检查一次，因此实际关闭可能延后约 30 秒。Agent 会话超时和实例超时先后生效：会话 600 秒、实例 1200 秒时，最后一次操作后约 1800 秒释放无头实例。
-
-休眠只关闭无头 Browser，保留共享 Playwright 驱动，不影响仍在使用的有头实例。`service.ready` 在休眠时仍返回可用；下次浏览或渲染请求自动启动实例，并发请求共用同一次启动。关闭与新请求通过同一生命周期锁协调，已经开始关闭时到来的请求等待完成后再唤醒。
-
-PNG/PDF 渲染和 BrowserUse 的整体超时包含启动等待。底层 `session()` 的 `timeout` 设置单次 Playwright 操作时限，排队与浏览器启动另受服务配置限制。
-
-### 插件停止
-
-正常停止时先取消未完成调用并保存可用的 Agent 登录状态，再释放页面、两个浏览器实例、Playwright 驱动及回收任务。临时文件被清理，已保存的登录快照保留。
-
-浏览器崩溃、断电或强制结束进程无法保证保存最新登录状态。意外重启导致保留会话丢失时返回 `SESSION_LOST`，模型需要重新打开网站；自动休眠在无保留 Context 时才发生，不会通过关闭正在使用的会话来节省资源。
+正常停止或重载插件时，先取消未完成调用并保存可用的 Agent 登录状态，再关闭会话、清理个人临时文件；已有登录快照保留。浏览器崩溃、断电或强制结束进程无法保证保存最新状态。意外重启导致旧会话丢失时返回 `SESSION_LOST`，需要重新打开网址。实例的空闲关闭不会关闭仍保留的 Context，详细条件见[共享浏览器生命周期](./共享浏览器.md#lifecycle)。
 
 <a id="tools"></a>
 
@@ -105,7 +70,7 @@ PNG/PDF 渲染和 BrowserUse 的整体超时包含启动等待。底层 `session
 
 模型需要支持工具调用；显式配置提供商 `modalities` 时应包含 `tool_use`。截图另需图片输入能力。
 
-下文的工具调用代码展示模型工具的参数形式；其他插件的 Python 接入方式见 [其他插件接入](#integration)。
+下文的工具调用代码展示模型工具的参数形式；其他插件的 Python 接入方式见 [其他插件接入](./共享浏览器.md#integration)。
 
 Agent 使用 AstrBot 自身的工具调用循环决定下一步，插件负责执行操作并返回真实页面状态。工具分为三个累计层级，高层包含低层全部工具；未选层级的工具定义会从可用列表中移除，不占用模型上下文。
 
@@ -344,181 +309,15 @@ browser_evaluate(
 
 脚本超时或调用取消时会关闭当前会话，避免无限循环卡住后续操作；需要重新 `browser_open`。网页产生的请求仍经过当前会话的监听和拦截规则。工具层级仅控制模型可调用的工具，网站本身的 JavaScript 在所有层级始终正常运行。
 
-<a id="integration"></a>
-
-## 🔌 其他插件接入
-
-其他插件通过 AstrBot 的插件上下文获取已注册的浏览器服务：
-
-```python
-from astrbot.api.star import Star
-
-
-class ExamplePlugin(Star):
-    def get_browser(self):
-        metadata = self.context.get_registered_star("astrbot_plugin_browser")
-        if (
-            metadata is None
-            or not metadata.activated
-            or metadata.star_cls is None
-        ):
-            raise RuntimeError("请先启用 astrbot_plugin_browser")
-
-        browser = metadata.star_cls.service
-        if not browser.ready:
-            raise RuntimeError("浏览器服务尚未就绪")
-        return browser
-```
-
-浏览器服务的生命周期由本插件管理。调用方只使用 `service`，不要调用 `initialize()`、`close()`，也不要关闭共享的 Browser 或 Playwright 实例。
-
-开启空闲关闭后，`service.ready` 在实例休眠时仍表示服务可接受请求，现有接入插件无需修改。`render_html()`、`render_pdf()` 和 `session()` 自动唤醒实例；PNG/PDF 渲染的整体超时包含唤醒耗时，超时设置很短的调用需要为浏览器启动留出时间。
-
-### 接口一：`render_html()`
-
-把完整 HTML 渲染为 PNG 字节：
-
-```python
-browser = self.get_browser()
-
-png = await browser.render_html(
-    """
-    <!doctype html>
-    <html lang="zh-CN">
-      <head>
-        <meta charset="utf-8">
-        <style>
-          body { margin: 0; padding: 32px; font-size: 24px; }
-          .card { padding: 24px; border: 1px solid #ddd; }
-        </style>
-      </head>
-      <body><main class="card">本地 HTML 截图</main></body>
-    </html>
-    """,
-    viewport={"width": 900, "height": 720},
-    selector=".card",
-)
-```
-
-参数：
-
-| 参数 | 默认值 | 说明 |
-|---|---:|---|
-| `html` | 必填 | 完整 HTML 字符串，最大 48 MiB |
-| `viewport` | `1280x720` | CSS 视口，宽高均为 1～8192；面积最多约 1678 万像素 |
-| `selector` | `None` | 指定元素截图；元素不存在或不可见时抛出 `BrowserServiceError` |
-| `full_page` | `True` | 没有 `selector` 时是否截取完整页面 |
-| `javascript_enabled` | `False` | 是否为本次页面启用 JavaScript |
-| `timeout` | `30` | 本次任务超时时间，范围 0.1～300 秒 |
-| `max_pixels` | `32000000` | 整页或目标元素的最大截图面积；传 `None` 可关闭该项检查 |
-
-返回值是 PNG `bytes`：
-
-```python
-from astrbot.api.message_components import Image
-
-image = Image.fromBytes(png)
-```
-
-指定 `selector` 时只截取目标元素；不指定时，`full_page=True` 会截取整个页面，`full_page=False` 只截取当前视口。
-
-### 接口二：`render_pdf()`
-
-把完整 HTML 渲染为 PDF 字节：
-
-```python
-browser = self.get_browser()
-
-pdf = await browser.render_pdf(
-    "<html><body><h1>报告</h1><p>本地 PDF 内容</p></body></html>",
-    format="A4",
-    print_background=True,
-    margin={
-        "top": "10mm",
-        "right": "10mm",
-        "bottom": "10mm",
-        "left": "10mm",
-    },
-)
-```
-
-参数：
-
-| 参数 | 默认值 | 说明 |
-|---|---:|---|
-| `html` | 必填 | 完整 HTML 字符串，最大 48 MiB |
-| `format` | `A4` | Chromium 纸张格式，例如 `A4`、`Letter`、`Legal` |
-| `landscape` | `False` | 是否横向排版 |
-| `print_background` | `True` | 是否打印 CSS 背景 |
-| `prefer_css_page_size` | `True` | 是否优先使用 CSS `@page` 尺寸 |
-| `margin` | `None` | 页边距字典，值使用 CSS 单位，例如 `8mm`、`1cm` |
-| `viewport` | `1280x720` | 页面布局使用的 CSS 视口 |
-| `javascript_enabled` | `False` | 是否为本次页面启用 JavaScript |
-| `timeout` | `30` | 本次任务超时时间，范围 0.1～300 秒 |
-
-返回值是 PDF `bytes`。服务不会替调用方写入文件：
-
-```python
-from pathlib import Path
-
-Path("report.pdf").write_bytes(pdf)
-```
-
-### 接口三：`session()`
-
-需要自行测量 DOM、分页或控制截图细节时，使用页面会话接口：
-
-```python
-browser = self.get_browser()
-
-async with browser.session(
-    viewport={"width": 1200, "height": 2100},
-    javascript_enabled=False,
-    device_scale_factor=1,
-    timeout=30,
-) as page:
-    await page.set_content(
-        "<html><body><main id='content'>报告内容</main></body></html>",
-        wait_until="load",
-    )
-    await page.evaluate("document.fonts.ready")
-
-    height = await page.locator("#content").evaluate(
-        "element => element.scrollHeight"
-    )
-    png = await page.locator("#content").screenshot(
-        type="png",
-        animations="disabled",
-    )
-```
-
-`session()` 参数：
-
-| 参数 | 默认值 | 说明 |
-|---|---:|---|
-| `viewport` | `1280x720` | CSS 视口尺寸 |
-| `javascript_enabled` | `False` | 仅影响当前会话 |
-| `device_scale_factor` | `1` | 设备像素比，范围 0.5～3 |
-| `timeout` | `30` | Playwright 默认操作超时时间，范围 0.1～300 秒 |
-
-会话退出时，页面和 BrowserContext 会自动关闭。即使截图或业务代码抛出异常，也会执行清理。
-
 <a id="boundaries"></a>
 
 ## 🛡️ 边界与错误
 
-- 离线渲染接口中止页面请求，因此外部 CSS、图片、字体和脚本不会被加载。
-- 离线渲染接口默认禁用 JavaScript；调用方可以对单个任务显式开启。
-- Agent 会话启用 JavaScript、允许联网，并独立保留 Cookie 和存储。
-- HTML 输入最大 48 MiB。
-- 单个视口最多约 1678 万像素。
-- `render_html()` 的 PNG 截图默认最多 3200 万像素；使用低层 `session()` 时，调用方需要自行控制截图尺寸。
-- `session()` 设置 Playwright 默认操作时限；`render_html()`、`render_pdf()` 和 Agent 工具另有整体超时保护。
-- Python 渲染接口失败抛出 `BrowserServiceError`；Agent 工具失败返回带错误码的结果。
+Agent 会话启用 JavaScript、允许联网，并独立保留 Cookie 和存储。个人白名单控制谁可以调用工具，不限制目标网站或主机网络地址。共享渲染 API 的页面包装和访问范围见[共享浏览器边界](./共享浏览器.md#boundaries)。
 
 ### 错误结果与处理
 
-Python 渲染接口失败抛出 `BrowserServiceError`；BrowserUse 工具失败返回 `success=false` 以及 `error.code`、`error.message`。
+BrowserUse 工具失败返回 `success=false` 以及 `error.code`、`error.message`。
 
 | 错误码 | 含义与处理 |
 | --- | --- |
@@ -539,15 +338,7 @@ Python 渲染接口失败抛出 `BrowserServiceError`；BrowserUse 工具失败�
 
 ## 🧯 故障排查
 
-### 浏览器安装或启动失败
-
-插件找不到浏览器时会自动安装 Chromium。自动安装失败时，检查网络、写入权限和浏览器系统依赖，并在运行 AstrBot 的同一 Python 环境中执行：
-
-```bash
-python -m playwright install chromium
-```
-
-Linux 缺少系统依赖时使用 `python -m playwright install --with-deps chromium`。如果设置了 `browser.browser_executable`，检查路径是否绝对、文件是否存在、是否含多余引号；指定路径启动失败时不会自动切换程序。
+浏览器安装、启动、排队和实例空闲关闭问题见[共享浏览器故障排查](./共享浏览器.md#faq)。
 
 ### 没有可用工具或调用被拒绝
 
@@ -561,18 +352,6 @@ Linux 缺少系统依赖时使用 `python -m playwright install --with-deps chro
 
 无头模式没有窗口。有头窗口显示在 AstrBot 所在主机，需要开启有头入口、明确请求 `headed` 并具有可用图形桌面。远程服务器上的窗口不会显示在聊天用户的本地电脑上。
 
-### 离线渲染缺少外部资源
-
-渲染接口会中止页面的外部请求，外部 CSS、图片、字体和脚本不会加载。请将资源内联，或由调用方先取得资源后生成完整 HTML；即使为当前任务启用 JavaScript，也不会改变请求拦截规则。
-
-Agent 联网页面使用独立 Context，网页资源照常请求，不受离线渲染约定影响。
-
-### 任务排队、超时或实例迟迟没有关闭
-
-BrowserUse 与渲染共用执行名额，满额后等待 `browser.queue_timeout` 秒。PNG/PDF 渲染与 BrowserUse 另有整体超时；休眠后的首次请求还包含唤醒等待。调大并发前应考虑每个页面额外占用的内存。
-
-实例空闲关闭要求没有保留的无头 Context 和运行中、排队中的无头任务。Agent 会话仍在保留时，先等待会话回收，再等待实例空闲超时；后台检查还可能延后约 30 秒。
-
 ### 会话重开后仍需登录
 
 首先确认是在同一消息来源、同一发送者身份下重新打开。快照保存 Cookie、Local Storage 和 IndexedDB，不保存页面或 sessionStorage；网站也可能使凭据过期，要求重新验证。
@@ -583,15 +362,6 @@ BrowserUse 与渲染共用执行名额，满额后等待 `browser.queue_timeout`
 
 ## 🛠️ 开发验证
 
-在已安装 AstrBot 依赖的同一 Python 环境中运行：
+环境准备及完整检查命令见[开发验证](./共享浏览器.md#development)。
 
-```bash
-python -m pip install -r requirements-dev.txt
-python -m pytest -q
-python -m ruff check .
-python -m ruff format --check .
-```
-
-`tests/test_agent_browser.py` 自动选择已安装的 Chromium，启动本地测试网站验证表单和鼠标操作、上传下载、弹窗、结构化提取、精确等待、登录快照恢复、多标签页、iframe、Shadow DOM、截图坐标、会话隔离和取消清理；没有浏览器时明确跳过。`tests/test_browser_storage.py` 验证文件配额、失败清理与快照写入。`tests/test_service.py` 的额外 PNG/PDF 冒烟测试通过 `ASTRBOT_BROWSER_EXECUTABLE` 指定浏览器路径启用。测试不调用外部模型 API；截图结果另外经过 AstrBot 的真实工具执行器和 Agent 循环，验证图片进入下一次模型请求。
-
-空闲关闭另验证了渲染唤醒、并发启动、排队和运行中任务保护、保留 Context、登录恢复、有头实例隔离，以及插件停止时的回收任务清理。文档调整可单独检查本地链接、锚点、工具清单和配置默认值。
+`tests/test_agent_browser.py` 自动选择已安装的 Chromium，启动本地测试网站验证表单和鼠标操作、上传下载、弹窗、结构化提取、精确等待、登录快照恢复、多标签页、iframe、Shadow DOM、截图坐标、会话隔离和取消清理；没有浏览器时明确跳过。`tests/test_browser_storage.py` 验证文件配额、失败清理与快照写入。测试不调用外部模型 API；截图结果另外经过 AstrBot 的真实工具执行器和 Agent 循环，验证图片进入下一次模型请求。

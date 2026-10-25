@@ -338,7 +338,7 @@ async def test_headed_launch_failure_does_not_stop_headless(fake_runtime):
     service = BrowserService()
     await service.initialize()
     with pytest.raises(BrowserServiceError, match="有头浏览器启动失败"):
-        async with service.operation("headed"):
+        async with service._operation("headed"):
             pass
     assert service.ready and service._headed_browser is None
     fake_runtime.playwright.stop.assert_not_awaited()
@@ -498,7 +498,7 @@ async def test_queued_render_prevents_idle_shutdown_and_cancellation_releases_it
     service = BrowserService(idle_shutdown_enabled=True, max_concurrent_sessions=1)
     await service.initialize()
     try:
-        async with service.operation("headed"):
+        async with service._operation("headed"):
             task = asyncio.create_task(service.render_pdf("<html>queued</html>"))
             await asyncio.sleep(0)
             assert service._headless_operations == 1
@@ -521,7 +521,7 @@ async def test_retained_context_starts_idle_timer_only_when_closed(
 ):
     service = BrowserService(idle_shutdown_enabled=True)
     await service.initialize()
-    async with service.operation() as browser:
+    async with service._operation() as browser:
         context = await browser.new_context()
         service.track_context(context)
     service_clock.now += 5000
