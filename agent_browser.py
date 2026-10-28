@@ -1,4 +1,4 @@
-"""Keep isolated online browser sessions for multi-turn agent tools."""
+"""Manage isolated online sessions and explicitly authorized local CDP access."""
 
 from __future__ import annotations
 
@@ -8,8 +8,8 @@ import math
 import mimetypes
 import time
 import uuid
-from collections.abc import Iterable
-from contextlib import suppress
+from collections.abc import AsyncIterator, Iterable
+from contextlib import asynccontextmanager, suppress
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -33,10 +33,11 @@ from .browser_advanced import (
     environment,
     json_size,
 )
+from .browser_cdp import LocalCDP
 from .browser_errors import AgentBrowserError
 from .browser_storage import BrowserStorage
 from .browser_tools import TOOL_LEVELS, actions_for_level
-from .service import DEFAULT_VIEWPORT, BrowserService, BrowserServiceError
+from .service import BrowserService, BrowserServiceError
 
 OBSERVE_SCRIPT = Path(__file__).with_name("observation.js").read_text(encoding="utf-8")
 EXTRACT_SCRIPT = Path(__file__).with_name("extraction.js").read_text(encoding="utf-8")
@@ -127,6 +128,9 @@ class AgentSession:
     network: NetworkMonitor = field(default_factory=NetworkMonitor)
     interceptor: Interceptor = field(default_factory=Interceptor)
     environment: dict[str, Any] = field(default_factory=lambda: environment({}))
+    owned_pages: set[Page] = field(default_factory=set)
+    external_tabs: dict[str, Page] = field(default_factory=dict)
+    listeners: list[tuple[Any, str, Any]] = field(default_factory=list)
 
     async def invalidate(self) -> None:
         """Disconnect observation guards and release remote DOM references."""
@@ -155,6 +159,9 @@ class AgentBrowser:
         data_dir: Plugin-owned directory for login snapshots and temporary files.
         tool_level: Cumulative model tool level: basic, standard or full.
         headed_enabled: Allow explicit requests for the exclusive visible session.
+        cdp_enabled: Allow explicitly discovering and connecting to the running Chrome.
+        cdp_user_data_dir: Optional Chrome user data root for automatic discovery.
+        cdp_allow_existing_tabs: Allow explicitly selecting existing external pages.
     """
 
     def __init__(
@@ -167,6 +174,9 @@ class AgentBrowser:
         data_dir: Path | None = None,
         tool_level: str = "basic",
         headed_enabled: bool = True,
+        cdp_enabled: bool = False,
+        cdp_user_data_dir: str = "",
+        cdp_allow_existing_tabs: bool = False,
     ) -> None:
         for key, value, lower, upper in (
             ("browser_use.max_sessions", max_sessions, 1, 16),
@@ -178,6 +188,11 @@ class AgentBrowser:
         if type(headed_enabled) is not bool:
             raise BrowserServiceError("browser_use.headed_enabled 必须是布尔值。")
         self.headed_enabled = headed_enabled
+        self.cdp = LocalCDP(
+            enabled=cdp_enabled,
+            user_data_dir=cdp_user_data_dir,
+            allow_existing_tabs=cdp_allow_existing_tabs,
+        )
         self.service = service
         self.max_sessions = max_sessions
         self.idle_timeout = idle_timeout
@@ -190,6 +205,7 @@ class AgentBrowser:
         self._owner_locks: dict[Owner, asyncio.Lock] = {}
         self._creating: set[Owner] = set()
         self._headed_owner: Owner | None = None
+        self._cdp_owner: Owner | None = None
         self._tasks: set[asyncio.Task[Any]] = set()
         self._maintenance: set[asyncio.Task[Any]] = set()
         self._reaper: asyncio.Task[None] | None = None
@@ -237,7 +253,7 @@ class AgentBrowser:
             self._maintenance.discard(task)
             if not task.cancelled() and task.exception() is not None:
                 logger.warning(
-                    "Failed to clean up a closed headed session",
+                    "Failed to clean up a closed browser session",
                     exc_info=task.exception(),
                 )
 
@@ -256,7 +272,9 @@ class AgentBrowser:
             )
 
     async def _save_on_close(self, owner: Owner, session: AgentSession) -> bool | None:
-        """Best-effort final snapshot; a cleared session must stay cleared."""
+        """Best-effort final snapshot; external profiles must never be copied."""
+        if session.mode == "cdp":
+            return None
         try:
             async with self.storage.lock(owner):
                 if not session.auto_save:
@@ -281,6 +299,19 @@ class AgentBrowser:
         save_state: bool = False,
         release_headed: bool = True,
     ) -> bool | None:
+        if session.mode == "cdp":
+            session.closing = True
+            if self._sessions.get(owner) is session:
+                del self._sessions[owner]
+            try:
+                await self._release_cdp_pages(session)
+            finally:
+                try:
+                    await self.cdp.disconnect()
+                finally:
+                    if self._cdp_owner == owner:
+                        self._cdp_owner = None
+            return None
         saved = None
         defer_close = False
         session.closing = True
@@ -545,6 +576,91 @@ class AgentBrowser:
             with suppress(PlaywrightError, asyncio.TimeoutError):
                 await asyncio.wait_for(download.delete(), timeout=5)
 
+    @staticmethod
+    def _listen(session: AgentSession, emitter: Any, name: str, handler: Any) -> None:
+        emitter.on(name, handler)
+        if session.mode == "cdp":
+            session.listeners.append((emitter, name, handler))
+
+    async def _release_cdp_pages(self, session: AgentSession) -> None:
+        for emitter, name, handler in session.listeners:
+            with suppress(PlaywrightError):
+                emitter.remove_listener(name, handler)
+        session.listeners.clear()
+        with suppress(PlaywrightError, asyncio.TimeoutError):
+            await asyncio.wait_for(session.invalidate(), timeout=1)
+        for page in list(session.tabs.values()):
+            if not page.is_closed():
+                with suppress(PlaywrightError, asyncio.TimeoutError):
+                    await asyncio.wait_for(
+                        page.unroute("**/*", session.interceptor.route), timeout=1
+                    )
+                if page in session.owned_pages:
+                    with suppress(PlaywrightError, asyncio.TimeoutError):
+                        await asyncio.wait_for(page.close(), timeout=1)
+        session.tabs.clear()
+        session.owned_pages.clear()
+        session.external_tabs.clear()
+
+    async def _attach_cdp_page(
+        self, session: AgentSession, page: Page, *, owned: bool
+    ) -> None:
+        if page in session.tabs.values() or page.is_closed():
+            return
+        if session.closing or len(session.tabs) >= MAX_TABS:
+            if owned:
+                await page.close()
+            raise AgentBrowserError(
+                "TAB_LIMIT", f"每个会话最多管理 {MAX_TABS} 个标签页。"
+            )
+        if owned:
+            session.owned_pages.add(page)
+        self._register_page(session, page)
+        page.set_default_timeout(self.action_timeout * 1000)
+        page.set_default_navigation_timeout(self.action_timeout * 1000)
+        await page.route("**/*", session.interceptor.route)
+        self._listen(
+            session, page, "dialog", lambda dialog: self._handle_dialog(session, dialog)
+        )
+        if "network" in self.enabled_actions:
+            self._listen(session, page, "request", session.network.request)
+            self._listen(session, page, "response", session.network.response)
+            self._listen(session, page, "requestfinished", session.network.finished)
+            self._listen(
+                session,
+                page,
+                "requestfailed",
+                lambda r: session.network.finished(r, failed=True),
+            )
+
+        def popup_created(popup: Page) -> None:
+            async def attach() -> None:
+                with suppress(PlaywrightError, AgentBrowserError):
+                    await self._attach_cdp_page(session, popup, owned=True)
+
+            task = asyncio.create_task(attach())
+            self._maintenance.add(task)
+            task.add_done_callback(self._maintenance.discard)
+
+        self._listen(session, page, "popup", popup_created)
+
+    async def _new_page(self, session: AgentSession) -> Page:
+        if session.mode != "cdp":
+            return await session.context.new_page()
+        pending = asyncio.create_task(session.context.new_page())
+        try:
+            page = await asyncio.shield(pending)
+        except asyncio.CancelledError:
+            # A dispatched newPage can finish after the tool is cancelled. Keep
+            # its result long enough to close only the page we just created.
+            with suppress(PlaywrightError, asyncio.TimeoutError):
+                page = await asyncio.wait_for(pending, timeout=2)
+                await asyncio.wait_for(page.close(), timeout=1)
+            raise
+        await self._attach_cdp_page(session, page, owned=True)
+        await page.bring_to_front()
+        return page
+
     def _register_page(self, session: AgentSession, page: Page) -> None:
         if len([p for p in session.tabs.values() if not p.is_closed()]) >= MAX_TABS:
             session.notices.append(f"标签页超过 {MAX_TABS} 个，已关闭新增标签页。")
@@ -562,14 +678,19 @@ class AgentBrowser:
         session.next_tab += 1
         tab_id = f"tab_{session.next_tab}"
         session.tabs[tab_id] = page
-        page.on("download", lambda download: self._start_download(session, download))
+        self._listen(
+            session,
+            page,
+            "download",
+            lambda download: self._start_download(session, download),
+        )
 
         def page_closed() -> None:
             session.tabs.pop(tab_id, None)
-            if session.mode == "headed":
+            if session.mode in {"headed", "cdp"}:
                 self._schedule_external_close(session)
 
-        page.on("close", page_closed)
+        self._listen(session, page, "close", page_closed)
         if not session.active_tab:
             session.active_tab = tab_id
 
@@ -650,7 +771,7 @@ class AgentBrowser:
                 "active_tab": session.active_tab,
                 "url": page.url[:2048],
                 "title": (await page.title())[:500],
-                "viewport": page.viewport_size,
+                "viewport": await self._viewport(page),
                 "frames": frames,
                 "frames_truncated": len(page.frames) > MAX_FRAMES,
                 "tabs": [
@@ -684,13 +805,20 @@ class AgentBrowser:
             )
 
     async def execute(
-        self, owner: Owner, action: str, **arguments: Any
+        self,
+        owner: Owner,
+        action: str,
+        *,
+        cdp_authorized: bool = False,
+        **arguments: Any,
     ) -> BrowserResult:
         """Execute one bounded tool operation for a server-derived owner.
 
         Args:
             owner: Message source and sender identity, never model supplied.
             action: Operation implemented by the registered model tools.
+            cdp_authorized: Trusted permission result from the plugin event handler;
+                never supplied by a model or retained across calls.
             **arguments: Validated operation-specific parameters.
 
         Returns:
@@ -747,7 +875,9 @@ class AgentBrowser:
             self._tasks.add(task)
         try:
             return await asyncio.wait_for(
-                self._serialized_execute(owner, action, arguments),
+                self._serialized_execute(
+                    owner, action, arguments, cdp_authorized=cdp_authorized
+                ),
                 timeout=self.action_timeout,
             )
         except asyncio.TimeoutError as exc:
@@ -755,6 +885,8 @@ class AgentBrowser:
                 "TIMEOUT",
                 "JavaScript 执行超时，当前会话已关闭，请重新打开网站。操作可能已执行。"
                 if action == "evaluate"
+                else "连接当前 Chrome 超时，请检查远程调试开关并在浏览器授权窗口中点击允许；可调大 browser_use.action_timeout 后显式重试连接。"
+                if action == "mode" and arguments.get("mode") == "cdp"
                 else "浏览器工具超时；操作可能已执行，请重新观察确认结果，不要直接重复操作。",
             ) from exc
         except PlaywrightError as exc:
@@ -776,11 +908,27 @@ class AgentBrowser:
                 self._tasks.discard(task)
 
     async def _serialized_execute(
-        self, owner: Owner, action: str, args: dict[str, Any]
+        self,
+        owner: Owner,
+        action: str,
+        args: dict[str, Any],
+        *,
+        cdp_authorized: bool = False,
     ) -> BrowserResult:
         async with self._owner_lock(owner):
             if self._closed:
                 raise AgentBrowserError("SERVICE_CLOSED", "Agent 浏览器服务已停止。")
+            current = self._sessions.get(owner)
+            if (action == "mode" and args.get("mode") == "cdp") or (
+                current is not None and current.mode == "cdp"
+            ):
+                if not self.cdp.enabled:
+                    raise AgentBrowserError("CDP_DISABLED", "本地 CDP 控制已关闭。")
+                if cdp_authorized is not True:
+                    raise AgentBrowserError(
+                        "CDP_PERMISSION_DENIED",
+                        "仅符合 CDP 使用者配置的 AstrBot 管理员可控制本地浏览器。",
+                    )
             result = await self._execute(owner, action, args)
             session = self._sessions.get(owner)
             result.data.setdefault(
@@ -789,13 +937,18 @@ class AgentBrowser:
             return result
 
     async def _mode(self, owner: Owner, target: str) -> BrowserResult:
-        if target not in {"status", "headless", "headed"}:
+        if target not in {"status", "headless", "headed", "cdp"}:
             raise AgentBrowserError(
-                "INVALID_ARGUMENT", "mode 为 status/headless/headed。"
+                "INVALID_ARGUMENT", "mode 为 status/headless/headed/cdp。"
             )
         previous = self._sessions.get(owner)
         if previous is not None and (
-            previous.context_closed or not previous.context.browser.is_connected()
+            previous.context_closed
+            or not previous.context.browser.is_connected()
+            or (
+                previous.mode == "cdp"
+                and self.cdp.browser is not previous.context.browser
+            )
         ):
             await self._drop(owner, previous)
             previous = None
@@ -807,6 +960,9 @@ class AgentBrowser:
                     "session_active": previous is not None,
                     "headed_enabled": self.headed_enabled,
                     "headed_in_use": self._headed_owner is not None,
+                    "cdp_enabled": self.cdp.enabled,
+                    "cdp_in_use": self._cdp_owner is not None,
+                    "cdp_allow_existing_tabs": self.cdp.allow_existing_tabs,
                 }
             )
         if target == "headed" and not self.headed_enabled:
@@ -832,6 +988,8 @@ class AgentBrowser:
                     "session_rebuilt": False,
                 }
             )
+        if target == "cdp":
+            return await self._enter_cdp(owner, previous)
         if target == "headed":
             async with self._registry_lock:
                 if self._headed_owner is not None and self._headed_owner != owner:
@@ -856,6 +1014,86 @@ class AgentBrowser:
                     if self._headed_owner == owner:
                         self._headed_owner = None
             raise
+
+    async def _enter_cdp(
+        self, owner: Owner, previous: AgentSession | None
+    ) -> BrowserResult:
+        async with self._registry_lock:
+            if self._cdp_owner is not None and self._cdp_owner != owner:
+                raise AgentBrowserError(
+                    "CDP_BUSY", "本地 CDP 浏览器已被其他会话占用，请先关闭该会话。"
+                )
+            if (
+                previous is None
+                and len(self._sessions) + len(self._creating) >= self.max_sessions
+            ):
+                raise AgentBrowserError("SESSION_LIMIT", "浏览器会话数量已达上限。")
+            self._cdp_owner = owner
+            if previous is None:
+                self._creating.add(owner)
+        session = None
+        try:
+            async with self.service._capacity():
+                browser = await self.cdp.connect(self.action_timeout)
+                session = AgentSession(
+                    browser.contexts[0],
+                    owner=owner,
+                    mode="cdp",
+                    auto_save=False,
+                    environment={},
+                )
+
+                def disconnected() -> None:
+                    session.context_closed = True
+                    self._schedule_external_close(session)
+
+                self._listen(session, browser, "disconnected", disconnected)
+                self._listen(session, session.context, "close", disconnected)
+                await self._new_page(session)
+                if previous is not None:
+                    # Only the plugin-owned source session may save its own state.
+                    await self._drop(owner, previous, save_state=True)
+                self._sessions[owner] = session
+                return BrowserResult(
+                    {
+                        "success": True,
+                        "mode": "cdp",
+                        "session_active": True,
+                        "session_rebuilt": True,
+                        "message": "已连接本机浏览器并新建标签页，使用该浏览器自身的登录状态。"
+                        + (
+                            "如需操作现有页面，请调用 browser_tabs(available)，再用 attach 接入用户明确选择的页面；也可用 browser_open 打开网站。"
+                            if self.cdp.allow_existing_tabs
+                            else "未接管已有标签页。请调用 browser_open 打开网站。"
+                        ),
+                    }
+                )
+        except BaseException:
+            try:
+                if session is not None:
+                    await self._release_cdp_pages(session)
+            finally:
+                await self.cdp.disconnect()
+                if self._cdp_owner == owner:
+                    self._cdp_owner = None
+            raise
+        finally:
+            self._creating.discard(owner)
+
+    @asynccontextmanager
+    async def _operation(self, mode: str) -> AsyncIterator[Browser]:
+        if mode != "cdp":
+            async with self.service._operation(mode) as browser:
+                yield browser
+        else:
+            async with self.service._capacity():
+                browser = self.cdp.browser
+                if browser is None or not browser.is_connected():
+                    raise AgentBrowserError(
+                        "CDP_DISCONNECTED",
+                        "本地 CDP 连接已断开，请显式重新切换到 cdp 模式。",
+                    )
+                yield browser
 
     @staticmethod
     def validate_owner(owner: Owner) -> None:
@@ -883,17 +1121,29 @@ class AgentBrowser:
         mode = current.mode if current is not None else "headless"
         if (
             current is not None
-            and mode == "headed"
-            and (current.context_closed or not current.context.browser.is_connected())
+            and mode in {"headed", "cdp"}
+            and (
+                current.context_closed
+                or not current.context.browser.is_connected()
+                or (mode == "cdp" and self.cdp.browser is not current.context.browser)
+            )
         ):
             await self._drop(owner, current)
             raise AgentBrowserError(
                 "SESSION_LOST",
-                "有头窗口已关闭，原会话已失效；重新打开网址默认使用无头模式。",
+                "浏览器窗口或连接已关闭，原会话已失效；重新打开网址默认使用无头模式。",
             )
         if action == "close" and current is None:
             return BrowserResult(
                 {"success": True, "session_closed": True, "state_saved": None}
+            )
+        if mode == "cdp" and (
+            action == "state"
+            or (action == "emulate" and args.get("operation", "status") != "status")
+        ):
+            raise AgentBrowserError(
+                "CDP_UNSUPPORTED",
+                "CDP 模式使用外部浏览器自身的登录和环境，不支持登录快照操作或环境重建。",
             )
         if action == "emulate":
             operation, settings = (
@@ -909,7 +1159,7 @@ class AgentBrowser:
                 )
             if operation in {"set", "reset"}:
                 options = environment(settings if operation == "set" else {})
-                async with self.service._operation(mode) as browser:
+                async with self._operation(mode) as browser:
                     return await self._replace_session(owner, browser, options=options)
         if action == "download":
             return await self._files(owner, args)
@@ -944,7 +1194,7 @@ class AgentBrowser:
             if operation == "restore":
                 async with self.storage.lock(owner):
                     saved = self.storage.read_state(owner)
-                async with self.service._operation(mode) as browser:
+                async with self._operation(mode) as browser:
                     result = await self._replace_session(owner, browser, saved=saved)
                     result.data["restored"] = True
                     return result
@@ -979,7 +1229,7 @@ class AgentBrowser:
             raise AgentBrowserError(
                 "NO_SESSION", "当前没有浏览器会话，请先调用 browser_open。"
             )
-        async with self.service._operation(mode) as browser:
+        async with self._operation(mode) as browser:
             session = await self._get_session(
                 owner,
                 browser,
@@ -1034,7 +1284,7 @@ class AgentBrowser:
         try:
             async with previous.lock if previous else asyncio.Lock():
                 preserve_auto_save = saved is None
-                if previous is not None:
+                if previous is not None and previous.mode != "cdp":
                     if saved is None:
                         if (
                             previous.mode == mode
@@ -1047,7 +1297,7 @@ class AgentBrowser:
                         saved = await previous.context.storage_state(indexed_db=True)
                     if options is None:
                         options = previous.environment
-                if previous is None and saved is None:
+                if saved is None:
                     session = await self._restore_session(
                         owner, browser, options, mode=mode
                     )
@@ -1057,7 +1307,7 @@ class AgentBrowser:
                     )
                 try:
                     await session.context.new_page()
-                    if previous is not None:
+                    if previous is not None and previous.mode != "cdp":
                         if preserve_auto_save:
                             session.auto_save = previous.auto_save
                         session.interceptor.rules = dict(previous.interceptor.rules)
@@ -1082,6 +1332,47 @@ class AgentBrowser:
                 )
         finally:
             self._creating.discard(owner)
+
+    async def _cdp_tabs(
+        self, session: AgentSession, operation: str, tab_id: str
+    ) -> BrowserResult:
+        if session.mode != "cdp" or not self.cdp.allow_existing_tabs:
+            raise AgentBrowserError(
+                "CDP_EXISTING_TABS_DISABLED",
+                "接入已有标签页未开启；仅可管理插件新建的标签页。",
+            )
+        if operation == "available":
+            if tab_id:
+                raise AgentBrowserError(
+                    "INVALID_ARGUMENT", "列出可接入标签页时不要传 tab_id。"
+                )
+            session.external_tabs = {
+                "external_" + uuid.uuid4().hex[:12]: page
+                for page in session.context.pages
+                if page not in session.tabs.values() and not page.is_closed()
+            }
+            return BrowserResult(
+                {
+                    "success": True,
+                    "tabs": [
+                        {"id": key, "url": page.url}
+                        for key, page in session.external_tabs.items()
+                    ],
+                }
+            )
+        page = session.external_tabs.get(tab_id)
+        if page is None or page.is_closed():
+            raise AgentBrowserError(
+                "INVALID_TAB", "请先列出可接入标签页，再使用用户指定的真实编号。"
+            )
+        await session.invalidate()
+        await self._attach_cdp_page(session, page, owned=False)
+        await page.bring_to_front()
+        session.active_tab = next(
+            key for key, item in session.tabs.items() if item is page
+        )
+        session.external_tabs.pop(tab_id, None)
+        return await self._observe(session)
 
     async def _files(self, owner: Owner, args: dict[str, Any]) -> BrowserResult:
         operation, file_id = args.get("operation", "list"), args.get("file_id", "")
@@ -1367,6 +1658,12 @@ class AgentBrowser:
             raise AgentBrowserError("STALE_ELEMENT", "目标元素已失效，请重新观察页面。")
         return target
 
+    @staticmethod
+    async def _viewport(page: Page) -> dict[str, int]:
+        return page.viewport_size or await page.evaluate(
+            "({width: innerWidth, height: innerHeight})"
+        )
+
     async def _check_coordinates(
         self, session: AgentSession, page: Page, points: tuple[tuple[float, float], ...]
     ) -> None:
@@ -1378,7 +1675,7 @@ class AgentBrowser:
                 else "SCREENSHOT_REQUIRED",
                 session.coordinate_notice or "坐标操作前请先获取当前视口截图。",
             )
-        viewport = page.viewport_size or DEFAULT_VIEWPORT
+        viewport = await self._viewport(page)
         for x, y in points:
             if any(
                 isinstance(value, bool)
@@ -1450,7 +1747,7 @@ class AgentBrowser:
         if box is None:
             raise AgentBrowserError("STALE_ELEMENT", "拖拽元素不可见，请重新观察页面。")
         x, y = box["x"] + box["width"] / 2, box["y"] + box["height"] / 2
-        viewport = page.viewport_size or DEFAULT_VIEWPORT
+        viewport = await AgentBrowser._viewport(page)
         if not (0 <= x < viewport["width"] and 0 <= y < viewport["height"]):
             raise AgentBrowserError(
                 "TARGET_OUTSIDE_VIEWPORT",
@@ -1529,6 +1826,8 @@ class AgentBrowser:
         if action == "tabs":
             operation = args.get("operation", "list")
             tab_id = args.get("tab_id", "")
+            if operation in {"available", "attach"}:
+                return await self._cdp_tabs(session, operation, tab_id)
             if operation not in {"list", "switch", "close"}:
                 raise AgentBrowserError(
                     "INVALID_ARGUMENT", "operation 只能是 list、switch 或 close。"
@@ -1563,6 +1862,8 @@ class AgentBrowser:
                     if key != tab_id and not tab.is_closed()
                 ]
                 if not remaining:
+                    if session.mode == "cdp":
+                        await page.close()
                     saved = await self._drop(owner, session, save_state=True)
                     return BrowserResult(
                         {"success": True, "session_closed": True, "state_saved": saved}
@@ -1571,16 +1872,18 @@ class AgentBrowser:
                 session.tabs.pop(tab_id, None)
                 if session.active_tab == tab_id:
                     session.active_tab = remaining[0]
+                    if session.mode == "cdp":
+                        await self._page(session).bring_to_front()
             return await self._observe(session)
         if action == "open":
             await session.invalidate()
             page = session.tabs.get(session.active_tab)
             if args.get("new_tab", False) or page is None or page.is_closed():
-                if len(session.context.pages) >= MAX_TABS:
+                if len(session.tabs) >= MAX_TABS:
                     raise AgentBrowserError(
                         "TAB_LIMIT", f"每个会话最多打开 {MAX_TABS} 个标签页。"
                     )
-                page = await session.context.new_page()
+                page = await self._new_page(session)
                 session.active_tab = next(
                     key for key, item in session.tabs.items() if item is page
                 )
@@ -1708,4 +2011,5 @@ class AgentBrowser:
         async with self._registry_lock:
             for owner, session in list(self._sessions.items()):
                 await self._drop(owner, session, save_state=True)
+        await self.cdp.disconnect()
         self.storage.close()

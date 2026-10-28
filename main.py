@@ -69,6 +69,7 @@ class BrowserPlugin(Star):
             "idle_timeout",
             "action_timeout",
             "headed_enabled",
+            "cdp",
             "user_whitelist",
         }
         if unknown:
@@ -79,6 +80,26 @@ class BrowserPlugin(Star):
         self.browser_use_enabled = browser_use.get("enabled", True)
         if type(self.browser_use_enabled) is not bool:
             raise BrowserServiceError("browser_use.enabled 必须是布尔值。")
+        cdp = browser_use.get("cdp", {})
+        if not isinstance(cdp, dict):
+            raise BrowserServiceError("browser_use.cdp 必须是配置对象。")
+        unknown = set(cdp) - {
+            "enabled",
+            "user_data_dir",
+            "user_id",
+            "allow_existing_tabs",
+        }
+        if unknown:
+            raise BrowserServiceError(
+                "未知 CDP 配置："
+                + ", ".join(f"browser_use.cdp.{key}" for key in sorted(unknown))
+            )
+        self.cdp_user_id = cdp.get("user_id", "")
+        if not isinstance(self.cdp_user_id, str):
+            raise BrowserServiceError(
+                "browser_use.cdp.user_id 必须是个人用户 ID 字符串。"
+            )
+        self.cdp_user_id = self.cdp_user_id.strip()
         user_whitelist = browser_use.get("user_whitelist", [])
         if not isinstance(user_whitelist, list) or any(
             not isinstance(user_id, str) or not user_id.strip()
@@ -105,6 +126,9 @@ class BrowserPlugin(Star):
             data_dir=StarTools.get_data_dir("astrbot_plugin_browser"),
             tool_level=browser_use.get("tool_level", "basic"),
             headed_enabled=browser_use.get("headed_enabled", True),
+            cdp_enabled=cdp.get("enabled", False),
+            cdp_user_data_dir=cdp.get("user_data_dir", ""),
+            cdp_allow_existing_tabs=cdp.get("allow_existing_tabs", True),
         )
         self._tool_tasks: set[asyncio.Task] = set()
 
@@ -155,6 +179,24 @@ class BrowserPlugin(Star):
             self.agent.require_action(action)
             owner = (event.unified_msg_origin, event.get_sender_id())
             self.agent.validate_owner(owner)
+            cdp_authorized = (
+                (not self.cdp_user_id or event.get_sender_id() == self.cdp_user_id)
+                and callable(getattr(event, "is_admin", None))
+                and event.is_admin() is True
+            )
+            session = self.agent._sessions.get(owner)
+            if (
+                self.agent.cdp.enabled
+                and (
+                    (action == "mode" and arguments.get("mode") == "cdp")
+                    or (session is not None and session.mode == "cdp")
+                )
+                and not cdp_authorized
+            ):
+                raise AgentBrowserError(
+                    "CDP_PERMISSION_DENIED",
+                    "仅符合 CDP 使用者配置的 AstrBot 管理员可控制本地浏览器。",
+                )
             if action == "screenshot":
                 selected_provider = event.get_extra("selected_provider")
                 if selected_provider is not None:
@@ -180,7 +222,12 @@ class BrowserPlugin(Star):
                 attachment_errors = []
                 if action == "upload" and arguments.get("operation", "list") == "list":
                     attachment_errors = await self._import_attachments(event, owner)
-                result = await self.agent.execute(owner, action, **arguments)
+                authorization = (
+                    {"cdp_authorized": cdp_authorized} if self.agent.cdp.enabled else {}
+                )
+                result = await self.agent.execute(
+                    owner, action, **authorization, **arguments
+                )
                 if attachment_errors:
                     result.data["attachment_errors"] = attachment_errors
                 if result.file is not None:
@@ -288,10 +335,10 @@ class BrowserPlugin(Star):
     async def browser_mode(
         self, event: AstrMessageEvent, mode: str = "status"
     ) -> CallToolResult:
-        """查询或切换个人浏览器模式。默认无头，只有用户明确需要可见窗口时才切换 headed。窗口显示在 AstrBot 所在主机。最多一个有头会话；占用时不会抢占。切换保留登录存储但重建页面，不写磁盘，之后需 browser_open。关闭会话后默认回到无头。
+        """查询或切换个人浏览器模式。默认无头，用户明确需要可见窗口时才切换 headed。窗口位于 AstrBot 主机。cdp 仅在用户明确要求连接本机已有浏览器时使用，需管理员开启；使用者 ID 留空允许任意管理员，填写后仅允许对应管理员；自动连接当前 Chrome 时用户需在浏览器授权窗口点击允许，失败后不自动重试。进入时只新建标签页，如需操作现有页面用 browser_tabs 的 available/attach 明确选择。使用外部浏览器自身登录，进入或退出 CDP 均不迁移登录状态。普通有头/无头切换保留登录存储但重建页面。关闭会话后默认回到无头。
 
         Args:
-            mode(string): status 查询且不启动浏览器；headed 切换有头；headless 切回无头。
+            mode(string): status 查询且不启动浏览器；headed 切换有头；headless 切回无头；cdp 显式自动发现并连接当前 Chrome。
         """
         return await self._tool(event, "mode", mode=mode)
 
@@ -590,7 +637,7 @@ class BrowserPlugin(Star):
     async def browser_state(
         self, event: AstrMessageEvent, operation: str = "status"
     ) -> CallToolResult:
-        """管理个人登录快照，包含 Cookie、Local Storage 和 IndexedDB，不含 sessionStorage。正常结束会话前自动保存，新会话自动恢复。save 可提前保存并重新启用当前会话的自动保存；restore 关闭旧标签页并载入磁盘快照，之后需 browser_open。
+        """管理普通模式的个人登录快照，包含 Cookie、Local Storage 和 IndexedDB，不含 sessionStorage。CDP 使用外部浏览器自身登录状态，不支持此工具。普通会话正常结束前自动保存，新会话自动恢复。save 可提前保存并重新启用当前会话的自动保存；restore 关闭旧标签页并载入磁盘快照，之后需 browser_open。
 
         Args:
             operation(string): status 查询是否已保存；save 保存；restore 恢复；clear 删除磁盘快照并停用当前会话的自动保存，保留当前页面登录；彻底清除需再调用 browser_close。
@@ -656,7 +703,7 @@ class BrowserPlugin(Star):
         operation: str = "status",
         settings: dict | None = None,
     ) -> CallToolResult:
-        """查询或模拟当前个人会话的设备、语言、时区、位置和主题。set/reset 会重建会话并关闭旧标签页，保留 Cookie/Local Storage/IndexedDB；之后需 browser_open。不会写登录快照。
+        """查询或模拟当前个人会话的设备、语言、时区、位置和主题。set/reset 会重建会话并关闭旧标签页，保留 Cookie/Local Storage/IndexedDB；之后需 browser_open。不会写登录快照。CDP 仅支持 status，返回空对象表示环境由外部浏览器管理。
 
         Args:
             operation(string): status 查询、set 设置、reset 恢复默认。set 完整替换环境，未传字段使用默认；status/reset 不传 settings。
@@ -699,15 +746,15 @@ class BrowserPlugin(Star):
     async def browser_tabs(
         self, event: AstrMessageEvent, operation: str = "list", tab_id: str = ""
     ) -> CallToolResult:
-        """列出、切换或关闭个人会话中的标签页。弹出的新标签页会出现在列表中，需主动切换。关闭最后一个标签页会结束会话。
+        """列出、切换或关闭个人会话管理的标签页。弹出的新标签页需主动切换。关闭最后一个标签页会结束会话。CDP 默认只管理插件新建的页面；允许接入已有页面时，仅在用户明确要求时使用 available 列出可接入页面，再用 attach 接入用户指定的编号并激活页面。CDP 新建页面、切换页面或关闭当前页后选择剩余页面时也会激活目标标签页。退出 CDP 保留接入的已有页面，显式 close 则会关闭指定页面。
 
         Args:
-            operation(string): list、switch 或 close，默认 list。
-            tab_id(string): switch/close 时使用列表中的标签页编号；list 时留空。
+            operation(string): list、switch、close；CDP 可选 available、attach，默认 list。
+            tab_id(string): switch/close 使用已管理标签页编号；attach 使用 available 返回的 external_ 编号；list/available 时留空。
         """
         return await self._tool(event, "tabs", operation=operation, tab_id=tab_id)
 
     @llm_tool(name="browser_close")
     async def browser_close(self, event: AstrMessageEvent) -> CallToolResult:
-        """结束当前使用者的浏览器会话，自动保存登录快照后关闭全部标签页，下次打开自动恢复。任务结束且不需要继续浏览时调用；彻底清除登录需先 browser_state(clear) 再关闭。state_saved 为 true/false/null 分别表示保存成功、失败或因 clear 跳过。"""
+        """结束当前使用者的浏览器会话。普通模式保存登录快照后关闭全部标签页，下次打开自动恢复；CDP 模式只关闭插件新建的标签页并断开连接，保留用户浏览器及接入的已有页面，不保存登录快照。任务结束且不需要继续浏览时调用。普通模式彻底清除登录需先 browser_state(clear) 再关闭。state_saved 为 true/false/null 表示保存成功、失败或跳过。"""
         return await self._tool(event, "close")

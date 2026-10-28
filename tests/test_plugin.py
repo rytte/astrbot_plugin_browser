@@ -157,6 +157,26 @@ def test_plugin_reads_grouped_browser_use_settings():
         ({"browser_use": {"enabled": "false"}}, "enabled 必须是布尔值"),
         ({"browser_use": {"enabled": 0}}, "enabled 必须是布尔值"),
         ({"browser_use": {"headed_enabled": 0}}, "headed_enabled 必须是布尔值"),
+        ({"browser_use": {"cdp": None}}, "browser_use.cdp 必须是配置对象"),
+        ({"browser_use": {"cdp": False}}, "browser_use.cdp 必须是配置对象"),
+        ({"browser_use": {"cdp": {"unknown": True}}}, "未知 CDP 配置"),
+        ({"browser_use": {"cdp_enabled": True}}, "未知 BrowserUse 配置"),
+        ({"browser_use": {"cdp": {"enabled": 0}}}, "enabled 必须是布尔值"),
+        ({"browser_use": {"cdp": {"auto_connect": True}}}, "未知 CDP 配置"),
+        ({"browser_use": {"cdp": {"user_data_dir": None}}}, "user_data_dir 必须是"),
+        (
+            {"browser_use": {"cdp": {"user_data_dir": "relative"}}},
+            "user_data_dir 必须是",
+        ),
+        ({"browser_use": {"cdp": {"user_id": None}}}, "user_id 必须是"),
+        (
+            {"browser_use": {"cdp": {"endpoint": "http://example.com:9222"}}},
+            "未知 CDP 配置",
+        ),
+        (
+            {"browser_use": {"cdp": {"allow_existing_tabs": 1}}},
+            "allow_existing_tabs 必须是布尔值",
+        ),
         ({"browser_use": {"max_sessions": 0}}, "browser_use.max_sessions"),
         ({"browser_use": {"idle_timeout": 0}}, "browser_use.idle_timeout"),
         ({"browser_use": {"action_timeout": 0}}, "browser_use.action_timeout"),
@@ -187,6 +207,12 @@ def test_schema_loads_configuration_groups(tmp_path):
         "browser_use": {
             "enabled": True,
             "headed_enabled": True,
+            "cdp": {
+                "enabled": False,
+                "user_data_dir": "",
+                "user_id": "",
+                "allow_existing_tabs": True,
+            },
             "user_whitelist": [],
             "tool_level": "basic",
             "max_sessions": 4,
@@ -355,6 +381,85 @@ def event(sender="alice", origin="test:group:one", *, admin=True):
         get_extra=lambda key: None,
         is_admin=lambda: admin,
     )
+
+
+@pytest.mark.parametrize(
+    ("cdp_settings", "restricted"),
+    [
+        ({}, False),
+        ({"user_id": ""}, False),
+        ({"user_id": "  "}, False),
+        ({"user_id": " alice "}, True),
+    ],
+)
+@pytest.mark.parametrize("sender", ["alice", "bob"])
+@pytest.mark.parametrize("admin", [True, False])
+async def test_cdp_requires_admin_and_optional_user_id_on_every_call(
+    cdp_settings, restricted, sender, admin, tmp_path
+):
+    allowed = admin and (not restricted or sender == "alice")
+    plugin = BrowserPlugin(
+        SimpleNamespace(),
+        {
+            "browser_use": {
+                "cdp": {
+                    "enabled": True,
+                    "user_data_dir": str(tmp_path),
+                    **cdp_settings,
+                },
+                "tool_level": "standard",
+                "user_whitelist": ["alice", "bob"],
+            }
+        },
+    )
+    assert plugin.agent.cdp.user_data_dir == tmp_path
+    plugin.agent.execute = AsyncMock(return_value=BrowserResult({"success": True}))
+    plugin._import_attachments = AsyncMock(return_value=[])
+    current = event(sender=sender, admin=admin)
+    try:
+        result = await plugin.browser_mode(current, mode="cdp")
+        assert result.isError is (not allowed)
+        if allowed:
+            plugin.agent.execute.assert_awaited_once_with(
+                (current.unified_msg_origin, sender),
+                "mode",
+                mode="cdp",
+                cdp_authorized=True,
+            )
+        else:
+            assert (
+                json.loads(result.content[0].text)["error"]["code"]
+                == "CDP_PERMISSION_DENIED"
+            )
+            plugin.agent.execute.assert_not_awaited()
+        plugin.agent.execute.reset_mock()
+        # A later call must check current administrator status, not only entry.
+        plugin.agent._sessions[(current.unified_msg_origin, sender)] = SimpleNamespace(
+            mode="cdp"
+        )
+        result = await plugin.browser_upload(current)
+        assert result.isError is (not allowed)
+        if allowed:
+            plugin.agent.execute.assert_awaited_once()
+            assert plugin.agent.execute.call_args.kwargs["cdp_authorized"] is True
+            plugin._import_attachments.assert_awaited_once()
+            plugin.agent.execute.reset_mock()
+            plugin._import_attachments.reset_mock()
+            current.is_admin = lambda: False
+            result = await plugin.browser_upload(current)
+            assert result.isError
+            assert (
+                json.loads(result.content[0].text)["error"]["code"]
+                == "CDP_PERMISSION_DENIED"
+            )
+            plugin.agent.execute.assert_not_awaited()
+            plugin._import_attachments.assert_not_awaited()
+        else:
+            plugin.agent.execute.assert_not_awaited()
+            plugin._import_attachments.assert_not_awaited()
+    finally:
+        plugin.agent._sessions.clear()
+        await plugin.terminate()
 
 
 async def test_tool_uses_event_identity_and_returns_structured_page_state():

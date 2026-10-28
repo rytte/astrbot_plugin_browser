@@ -86,11 +86,50 @@
         "default": true,
         "hint": "明确指定时允许启动有头浏览器窗口，显示在 AstrBot 所在主机的图形桌面；最多一个有头实例和一个有头会话，用完释放。无头浏览器和渲染始终保持原模式。"
       },
+      "cdp": {
+        "description": "本地浏览器控制（CDP）",
+        "type": "object",
+        "items": {
+          "enabled": {
+            "description": "允许连接本地浏览器（CDP）",
+            "type": "bool",
+            "default": false,
+            "hint": "仅在明确请求 cdp 模式时自动发现 AstrBot 所在主机上正在使用的 Chrome 144+；需先在 Chrome 启用远程调试，连接时点击允许。仅管理员可用，可通过使用者个人 ID 限定一名管理员，不影响共享渲染；保存后重载生效。"
+          },
+          "user_data_dir": {
+            "description": "Chrome 用户数据根目录（可选）",
+            "type": "string",
+            "default": "",
+            "condition": {
+              "enabled": true
+            },
+            "hint": "留空自动定位运行 AstrBot 的系统账户下稳定版 Chrome 的默认目录。自定义目录、其他通道或 Chromium 需填写绝对路径；取 chrome://version 中个人资料路径的上一级（不是 Default 或 Profile 1 子目录），不会创建或修改目录。"
+          },
+          "user_id": {
+            "description": "CDP 使用者个人 ID",
+            "type": "string",
+            "default": "",
+            "condition": {
+              "enabled": true
+            },
+            "hint": "留空允许任意 AstrBot 管理员使用；填写后仅允许该 ID 对应的管理员使用。个人白名单不授予 CDP 权限，同一浏览器最多被一个聊天会话占用。"
+          },
+          "allow_existing_tabs": {
+            "description": "允许选择已有标签页",
+            "type": "bool",
+            "default": true,
+            "condition": {
+              "enabled": true
+            },
+            "hint": "获授权的管理员可列出已有标签页并明确选择接入，退出连接时保留这些已有标签页；关闭后仅管理插件新建的标签页。"
+          }
+        }
+      },
       "max_sessions": {
         "description": "保留的 Agent 浏览器会话上限",
         "type": "int",
         "default": 4,
-        "hint": "允许 1～16。每个消息来源和发送者使用独立的联网浏览器会话，有头和无头合计计数；空闲会话不占执行并发名额。"
+        "hint": "允许 1～16。有头、无头与 CDP 会话合计计数；普通模式按消息来源和发送者隔离，CDP 另限一个管理员会话；空闲会话不占执行并发名额。"
       },
       "idle_timeout": {
         "description": "Agent 会话空闲回收时间（秒）",

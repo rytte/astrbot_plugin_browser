@@ -2,13 +2,13 @@
 
 BrowserUse 向模型提供联网网页操作工具。本文说明权限、个人会话、登录状态、工具契约及故障处理；安装步骤见[项目首页](../README.md)。共用 Chromium 的配置、生命周期和供其他插件使用的渲染接口见[共享浏览器](./共享浏览器.md)。
 
-[配置参考](#configuration) · [权限与隔离](#permissions) · [会话生命周期](#lifecycle) · [工具清单](#tools) · [页面操作](#observations) · [有头模式](#headed) · [登录与文件](#storage) · [高级控制](#advanced) · [边界与错误](#boundaries) · [故障排查](#faq) · [开发验证](#development)
+[配置参考](#configuration) · [权限与隔离](#permissions) · [会话生命周期](#lifecycle) · [工具清单](#tools) · [页面操作](#observations) · [有头模式](#headed) · [本地浏览器 CDP](#cdp) · [登录与文件](#storage) · [高级控制](#advanced) · [边界与错误](#boundaries) · [故障排查](#faq) · [开发验证](#development)
 
 <a id="configuration"></a>
 
 ## 💠 配置参考
 
-**BrowserUse**（`browser_use`）组只放 Agent 网页工具的专用配置：
+**BrowserUse**（`browser_use`）组只放 Agent 网页工具的专用配置，CDP 选项集中在其 `cdp` 子配置组：
 
 | 配置项 | 默认值 | 范围 | 说明 |
 |---|---:|---:|---|
@@ -16,11 +16,15 @@ BrowserUse 向模型提供联网网页操作工具。本文说明权限、个人
 | `browser_use.user_whitelist` | `[]` | 用户 ID 字符串列表 | 个人白名单，与管理员同权限，私聊及任意群聊均可用；空列表仅允许管理员 |
 | `browser_use.tool_level` | `basic` | `basic` / `standard` / `full` | 基础浏览 13 个、完整交互 19 个、高级控制 23 个工具，高层包含低层全部工具 |
 | `browser_use.headed_enabled` | `true` | 布尔值 | 允许明确请求时启动有头窗口；最多一个有头实例及会话 |
+| `browser_use.cdp.enabled` | `false` | 布尔值 | 明确请求时自动发现当前 Chrome 144+，等待浏览器授权后连接 |
+| `browser_use.cdp.user_data_dir` | 空 | 用户数据根目录 | 自动连接时可指定绝对路径；留空定位稳定版 Chrome 的默认目录 |
+| `browser_use.cdp.user_id` | 空 | 个人用户 ID | 留空允许任意 AstrBot 管理员使用；填写后仅允许该 ID 对应的管理员使用 |
+| `browser_use.cdp.allow_existing_tabs` | `true` | 布尔值 | 允许列出并明确选择接入已有标签页；默认只管理插件新建的页面 |
 | `browser_use.max_sessions` | `4` | 1～16 | 同时保留的 Agent 联网会话上限，与执行并发分别限制 |
 | `browser_use.idle_timeout` | `600` 秒 | 30～3600 | Agent 会话空闲回收时间 |
 | `browser_use.action_timeout` | `30` 秒 | 1～120 | 单次 Agent 工具总时限，包括排队、操作和观察 |
 
-保存配置后重载插件生效。关闭 BrowserUse 后，全部 `browser_*` 工具从可用工具列表中移除，工具定义不会发送给模型；缓存的直接调用也会返回 `BROWSER_USE_DISABLED`。重载会自动保存原有 Agent 会话的登录状态后关闭会话，并清理个人临时文件；已保存的登录快照保留。离线渲染由独立的 `render.enabled` 控制，工具管理中的单项启停设置保持不变。
+CDP 选项位于 `browser_use.cdp`，仅保留 `enabled`、`user_id`、`allow_existing_tabs` 和 `user_data_dir` 四项。保存配置后重载插件生效。关闭 BrowserUse 后，全部 `browser_*` 工具从可用工具列表中移除，工具定义不会发送给模型；缓存的直接调用也会返回 `BROWSER_USE_DISABLED`。重载会自动保存原有 Agent 会话的登录状态后关闭会话，并清理个人临时文件；已保存的登录快照保留。离线渲染由独立的 `render.enabled` 控制，工具管理中的单项启停设置保持不变。
 
 `render.enabled` 默认开启，关闭共享渲染不影响 BrowserUse。两者都关闭时，插件不初始化浏览器，也不触发 Chromium 自动安装。
 
@@ -40,21 +44,21 @@ BrowserUse 向模型提供联网网页操作工具。本文说明权限、个人
 
 白名单只填写消息发送者的个人用户 ID（如 QQ 号），不填写群号。授权只看个人，不限制聊天来源：授权用户可在私聊或任意群聊使用，同群其他人不会因此获得权限。插件仍遵守 AstrBot 自身的消息接收、唤醒和平台白名单设置。白名单按发送者 ID 精确匹配，与 AstrBot 管理员的 ID 匹配方式一致；多平台使用时，相同发送者 ID 会命中同一条目。
 
-每次调用全部 `browser_*` 工具时都会重新校验权限，未授权返回 `PERMISSION_DENIED`，不创建会话、不读取附件、不返回截图或发送文件。不同聊天来源的会话和登录快照继续分别隔离；获得授权不会合并会话或允许访问其他人的数据。保存配置后重载插件生效；升级后原先可用的非管理员用户需要加入白名单。供其他插件调用的 Python 离线渲染接口不受此个人白名单限制。
+每次调用全部 `browser_*` 工具时都会重新校验权限，未授权返回 `PERMISSION_DENIED`，不创建会话、不读取附件、不返回截图或发送文件。普通模式中不同聊天来源的会话和登录快照分别隔离。CDP 另要求管理员身份，填写 `user_id` 后还需匹配该 ID，并使用外部浏览器自身的账号状态，见[本地浏览器 CDP](#cdp)。保存配置后重载插件生效；升级后原先可用的非管理员用户需要加入白名单。供其他插件调用的 Python 离线渲染接口不受此个人白名单限制。
 
-会话身份由消息来源和发送者组成，对应 `(event.unified_msg_origin, event.get_sender_id())`，由插件从真实事件取得，模型不能指定。一个人的不同聊天来源也使用独立页面、文件与登录快照。
+会话身份由消息来源和发送者组成，对应 `(event.unified_msg_origin, event.get_sender_id())`，由插件从真实事件取得，模型不能指定。普通模式中一个人的不同聊天来源使用独立页面、文件与登录快照；CDP 同一时间只允许其中一个会话占用外部浏览器。
 
 <a id="lifecycle"></a>
 
 ## 🧩 会话生命周期
 
-BrowserUse 与离线渲染复用无头 Chromium，明确请求有头模式时才额外启动窗口。每个 Agent 身份有独立的 BrowserContext，跨多轮保留；登录状态不与其他身份或渲染 Context 共享。使用普通 Context 配合 `storage_state` 快照，不使用 persistent context 或共享用户目录，也不通过 CDP 接管本机已有的 Chrome。
+普通 BrowserUse 与离线渲染复用无头 Chromium，明确请求有头模式时才额外启动窗口。普通模式中每个 Agent 身份有独立的 BrowserContext，跨多轮保留；登录状态不与其他身份或渲染 Context 共享，使用 `storage_state` 快照恢复登录。显式启用的 CDP 模式使用外部浏览器默认 Context，连接与退出规则见[本地浏览器 CDP](#cdp)。
 
 ### 执行并发与保留会话
 
-`browser.max_concurrent_sessions` 限制同时执行的页面任务，BrowserUse 与渲染共用这些名额。无头与有头工具操作均占用执行名额，人工等待和保留但未操作的会话不占用。
+`browser.max_concurrent_sessions` 限制同时执行的页面任务，BrowserUse 与渲染共用这些名额。无头、有头与 CDP 工具操作均占用执行名额，人工等待和保留但未操作的会话不占用。
 
-`browser_use.max_sessions` 单独限制保留的 Agent 会话数，有头与无头合计计数；每个会话最多 8 个标签页。有头模式另有最多一个实例、一个活动会话的限制。
+`browser_use.max_sessions` 单独限制保留的 Agent 会话数，有头、无头与 CDP 合计计数；每个会话最多管理 8 个标签页。有头模式另有最多一个实例、一个活动会话的限制，CDP 也最多保留一个活动会话。
 
 同一身份的模型操作串行执行。排队最多等待 `browser.queue_timeout` 秒，BrowserUse 还受单次工具总超时约束。
 
@@ -62,7 +66,7 @@ BrowserUse 与离线渲染复用无头 Chromium，明确请求有头模式时才
 
 会话空闲达到 `browser_use.idle_timeout` 后由周期任务回收，默认 600 秒。显式调用 `browser_close()`、通过工具关闭最后一个标签页、插件正常停止或重载，也会结束会话。
 
-正常结束时先尝试保存登录快照，再关闭 Context。有头会话结束后同时释放有头实例；无头实例由[共享浏览器的空闲关闭设置](./共享浏览器.md#lifecycle)决定是否继续驻留。会话保存、恢复和 `clear` 的行为见 [登录状态与文件](#storage)。
+普通会话正常结束时先尝试保存登录快照，再关闭 Context。有头会话结束后同时释放有头实例；无头实例由[共享浏览器的空闲关闭设置](./共享浏览器.md#lifecycle)决定是否继续驻留。CDP 不保存快照、不关闭外部 Context 或浏览器，只清理插件管理的资源并断开连接。会话保存、恢复和 `clear` 的行为见 [登录状态与文件](#storage)。
 
 正常停止或重载插件时，先取消未完成调用并保存可用的 Agent 登录状态，再关闭会话、清理个人临时文件；已有登录快照保留。浏览器崩溃、断电或强制结束进程无法保证保存最新状态。意外重启导致旧会话丢失时返回 `SESSION_LOST`，需要重新打开网址。实例的空闲关闭不会关闭仍保留的 Context，详细条件见[共享浏览器生命周期](./共享浏览器.md#lifecycle)。
 
@@ -86,7 +90,7 @@ Agent 使用 AstrBot 自身的工具调用循环决定下一步，插件负责�
 
 | 工具 | 用途 |
 |---|---|
-| `browser_mode(mode="status")` | 查询模式；明确请求时切换 `headed` / `headless`，不额外保存磁盘快照 |
+| `browser_mode(mode="status")` | 查询模式；明确请求时切换 `headed` / `headless` / `cdp`，CDP 需额外配置授权 |
 | `browser_open(url, new_tab=False)` | 打开完整 HTTP/HTTPS 网址；首次调用创建个人会话 |
 | `browser_observe()` | 返回网址、标题、文字、元素清单及新的 `observation_id` |
 | `browser_screenshot()` | 将当前视口 PNG 和页面观察返回给支持视觉的模型 |
@@ -97,8 +101,8 @@ Agent 使用 AstrBot 自身的工具调用循环决定下一步，插件负责�
 | `browser_select(observation_id, ref, value)` | 按观察结果中的 `value` 选择原生下拉框选项 |
 | `browser_scroll(observation_id, direction="down", pixels=600)` | 向指定方向滚动，`pixels` 为 1～5000 的整数 |
 | `browser_wait(condition, value, state="", frame_index=0)` | 等待文字、CSS 元素、网址或页面加载状态；文字和元素支持出现/消失 |
-| `browser_tabs(operation="list", tab_id="")` | 列出、切换或关闭标签页，操作为 `list` / `switch` / `close` |
-| `browser_close()` | 自动保存登录快照后关闭个人会话和全部标签页 |
+| `browser_tabs(operation="list", tab_id="")` | `list` / `switch` / `close` 管理会话标签页；CDP 可选 `available` / `attach` 显式接入已有页面 |
+| `browser_close()` | 普通模式保存快照并关闭会话；CDP 关闭插件新建的页面并断开，保留用户已有页面 |
 
 ### 第二层：完整交互
 
@@ -206,13 +210,70 @@ browser_mode(mode="headless")   # 可选：在内存中交接回无头，随后�
 
 手动关窗会尽力保存仍可访问的 Context，并释放占用名额；若 Context 已销毁或浏览器崩溃，则保留旧磁盘快照，无法保证保存最后状态。后续观察不会自动重开有头窗口。有头启动失败或退出不停止无头渲染服务。`browser_use.headed_enabled=false` 可关闭有头入口。
 
+<a id="cdp"></a>
+
+## 🔌 本地浏览器控制（CDP）
+
+CDP 模式自动发现并连接 **AstrBot 所在主机**上正在使用的 Chrome 144+，复用该浏览器自己的 Cookie、Local Storage 和登录状态。它不能直接控制聊天用户另一台电脑上的浏览器；Docker 部署时，回环地址指容器自身。此功能默认关闭，沿用已有 Playwright 依赖，无需额外 Python 包。
+
+### 连接正在使用的普通 Chrome
+
+Chrome 144 及以上支持在浏览器运行期间开启远程调试，连接后保留当前用户资料、登录状态和已有页面，无需重新启动浏览器或另外登录。
+
+1. 在正在使用的 Chrome 中打开 `chrome://inspect/#remote-debugging`，启用远程调试。
+2. 在 BrowserUse → 本地浏览器控制（CDP）子配置组中开启 `enabled`，保存后重载插件。`user_id`（使用者的个人 ID）留空允许任意 AstrBot 管理员使用；填写后仅允许该 ID 对应的管理员使用。BrowserUse 白名单不授予 CDP 权限。若要操作已经打开的页面，确认 `allow_existing_tabs` 已开启（默认开启）。
+3. 明确请求连接当前浏览器，触发 `browser_mode(mode="cdp")`；随后在 Chrome 弹出的调试连接授权窗口中点击允许。授权由 Chrome 控制，插件不会代为开启开关或接受授权。
+4. 使用下文的 `available` 和 `attach` 选择要操作的现有标签页。
+
+自动连接从 Chrome 用户数据根目录读取 `DevToolsActivePort`，仅连接其中的回环 WebSocket 地址，不启动浏览器、不修改用户资料。插件加载和状态查询均不读取此文件或发起授权请求；每次重新连接都会重新读取，适应 Chrome 更换调试端口。
+
+`user_data_dir` 留空时使用运行 AstrBot 的系统账户下稳定版 Chrome 的默认目录：
+
+| 系统 | 默认用户数据根目录 |
+| --- | --- |
+| Linux | `~/.config/google-chrome`（尊重 `CHROME_CONFIG_HOME`、`XDG_CONFIG_HOME`） |
+| macOS | `~/Library/Application Support/Google/Chrome` |
+| Windows | `%LOCALAPPDATA%\Google\Chrome\User Data` |
+
+Chrome 使用自定义目录、Beta/Dev/Canary 或 Chromium 时，在 `user_data_dir` 填写实际绝对路径（支持 `~`）。可从 `chrome://version` 查看“个人资料路径”，填写其上一级用户数据目录，例如 `…/google-chrome`，**不要填写 `Default` 或 `Profile 1` 子目录**。多实例时通过此目录明确选择浏览器；不会扫描其他账户的目录或任选一个实例。AstrBot 需具备读取该文件的权限，并能连接 Chrome 的本机端口；Docker 默认无法直接连接宿主机 Chrome。
+
+默认单次工具总时限为 30 秒，包含等待浏览器授权；需要更多操作时间可把 `browser_use.action_timeout` 调至 60～120 秒，并确保 AstrBot 的工具调用时限足够。找不到调试文件返回 `CDP_DISCOVERY_FAILED`；浏览器拒绝、退出或连接失败返回 `CDP_CONNECTION_FAILED`，整体超时返回 `TIMEOUT`。启用开关、允许连接或修正配置后需明确重新请求，不会自动重试或重启 Chrome。
+
+参考：[Chrome 官方的当前会话连接说明](https://developer.chrome.com/blog/chrome-devtools-mcp-debug-your-browser-session)。
+
+调试地址由 Chrome 发布文件自动发现，固定连接本机回环地址，工具参数不接受调试地址或用户数据目录。无需配置端口、Node.js、MCP 服务或额外 Python 包。
+
+### 使用和标签页范围
+
+只有用户明确要求连接本机浏览器时才切换 CDP；普通 `browser_open` 仍默认使用无头模式，插件加载和状态查询不会预先连接外部浏览器。
+
+```python
+browser_mode(mode="cdp")
+browser_open(url="https://example.com")
+browser_observe()
+# 现有点击、输入、截图等工具继续操作当前页面
+browser_close()
+```
+
+进入时在外部浏览器默认 Context 中新建并激活空白标签页。默认 `browser_tabs(list)` 只列出插件管理的页面及其弹窗，网络监听、拦截、弹窗处理和下载也仅绑定这些页面，不为整个默认 Context 设置规则。用户自行打开的其他页面不会自动加入会话。每个会话最多管理 8 个页面，用户其他标签页不计入此限制。
+
+`allow_existing_tabs` 默认开启，允许获授权的管理员明确选择接入已有页面；关闭后仅管理插件新建的页面。仅在用户明确要求操作已有页面后，调用 `browser_tabs(operation="available")` 列出可接入页面；随后使用用户选定的真实 `external_...` 编号调用 `browser_tabs(operation="attach", tab_id="external_...")`。接入后激活该标签页，获得普通 `tab_...` 编号，可继续使用已有工具。CDP 新建、接入、显式切换标签页，以及关闭当前页后选择剩余页面时，都会同步激活目标标签页；网页弹出的页面仍需明确切换，才会成为 Agent 的操作目标。没有开启这个选项时，列出和接入均返回 `CDP_EXISTING_TABS_DISABLED`。
+
+### 独占、退出和登录状态
+
+同一外部浏览器最多由一个 Agent 会话占用。其他获授权的管理员或同一管理员在另一聊天来源接入时均会返回 `CDP_BUSY`，不会抢占原会话。每次工具调用重新校验管理员身份；执行仍占用与渲染相同的并发名额。CDP 会话按 `idle_timeout` 回收，只有工具操作续期，外部浏览器中的人工操作不续期。
+
+关闭会话、空闲回收、重载或停止插件时，关闭插件新建的页面，移除绑定的页面规则和监听，然后断开连接；不调用外部 Browser/Context 的关闭接口。显式接入的已有页面会保留，但若用户通过 `browser_tabs(close)` 明确关闭某个页面，该页面会被关闭。外部浏览器退出或连接中断后释放占用，不自动重新连接；需要用户再次明确请求 `browser_mode(mode="cdp")`。断线后无法保证清理仍留在外部浏览器中的页面。
+
+CDP 使用外部账号状态，不具有普通模式的独立 Context 隔离。进入 CDP 不向外部浏览器导入插件快照；若之前有普通会话，会先保存该普通会话自己的状态再结束它。退出 CDP 切回普通模式时，仅恢复插件原有快照，不导出或迁移外部账号状态。CDP 的 `browser_state` 操作与 `browser_emulate(set/reset)` 返回 `CDP_UNSUPPORTED`；查看当前环境返回空对象，表示由外部浏览器管理。普通有头/无头模式的原有行为保持不变。
+
 <a id="storage"></a>
 
 ## 💾 登录状态与文件
 
 ### 登录快照
 
-每个会话身份（消息来源＋发送者）有一份独立的登录状态快照，保存 Cookie、Local Storage 和 IndexedDB，不保存标签页、密码输入框或 sessionStorage。调用 `browser_close()`、通过 `browser_tabs` 关闭最后一个标签页、空闲回收和插件正常停止/卸载/重载时，在关闭 Context 前自动保存一次；创建新会话时自动载入自己的快照，无需手动调用 `save` 或 `restore`。自动保存和恢复在 `basic`、`standard`、`full` 层级均生效，浏览操作期间不自动写盘。切换浏览环境或显式恢复快照时的 Context 重建不触发自动保存。
+普通模式中每个会话身份（消息来源＋发送者）有一份独立的登录状态快照，保存 Cookie、Local Storage 和 IndexedDB，不保存标签页、密码输入框或 sessionStorage。调用 `browser_close()`、通过 `browser_tabs` 关闭最后一个标签页、空闲回收和插件正常停止/卸载/重载时，在关闭 Context 前自动保存一次；创建新会话时自动载入自己的快照，无需手动调用 `save` 或 `restore`。自动保存和恢复在 `basic`、`standard`、`full` 层级均生效，浏览操作期间不自动写盘。切换浏览环境或显式恢复快照时的 Context 重建不触发自动保存。
 
 `browser_state` 在 `standard/full` 层级提供显式管理：`save` 立即覆盖自己的上次保存，并重新启用当前会话的自动保存；`restore` 关闭现有标签页并载入磁盘快照，随后调用 `browser_open` 访问网站。`clear` 删除磁盘快照并停用当前会话的自动保存，当前页面仍保留登录；环境重建也会延续停用状态，显式 `save` 或创建下一次新会话后恢复自动保存。彻底清除当前登录及其快照可先 `clear` 再 `browser_close()`。
 
@@ -315,7 +376,7 @@ browser_evaluate(
 
 ## 🛡️ 边界与错误
 
-Agent 会话启用 JavaScript、允许联网，并独立保留 Cookie 和存储。个人白名单控制谁可以调用工具，不限制目标网站或主机网络地址。共享渲染 API 的页面包装和访问范围见[共享浏览器边界](./共享浏览器.md#boundaries)。
+普通 Agent 会话启用 JavaScript、允许联网，并独立保留 Cookie 和存储；CDP 则使用指定外部浏览器的默认 Context。个人白名单控制谁可以调用工具，不限制目标网站或主机网络地址。共享渲染 API 的页面包装和访问范围见[共享浏览器边界](./共享浏览器.md#boundaries)。
 
 ### 错误结果与处理
 
@@ -328,6 +389,11 @@ BrowserUse 工具失败返回 `success=false` 以及 `error.code`、`error.messa
 | `TOOL_LEVEL_REQUIRED` | 当前工具不在配置层级中，按任务需要调整层级 |
 | `VISION_UNAVAILABLE` | 当前模型或提供商未配置图片输入能力 |
 | `HEADED_DISABLED` / `HEADED_BUSY` | 有头入口关闭或被其他会话占用，调整配置或稍后重试 |
+| `CDP_DISABLED` / `CDP_PERMISSION_DENIED` | CDP 未启用、当前用户不是管理员，或不匹配配置的使用者 ID |
+| `CDP_BUSY` | 外部浏览器被另一聊天会话占用，先结束该会话 |
+| `CDP_DISCOVERY_FAILED` | 检查 Chrome 远程调试开关、用户数据根目录和文件读取权限 |
+| `CDP_CONNECTION_FAILED` / `CDP_DISCONNECTED` | 检查浏览器授权、远程调试开关及进程，明确请求重新接入 |
+| `CDP_EXISTING_TABS_DISABLED` / `CDP_UNSUPPORTED` | 未允许接入已有页面，或当前操作不适用于外部浏览器 |
 | `SESSION_EXPIRED` / `NO_SESSION` | 会话已回收或尚未创建，需要重新打开网址 |
 | `SESSION_LOST` | 浏览器意外重启导致旧会话失效，需要重新打开网址 |
 | `TIMEOUT` | 工具超过总时限，操作可能已经发生，应先观察再决定是否重试 |
@@ -367,3 +433,5 @@ BrowserUse 工具失败返回 `success=false` 以及 `error.code`、`error.messa
 环境准备及完整检查命令见[开发验证](./共享浏览器.md#development)。
 
 `tests/test_agent_browser.py` 自动选择已安装的 Chromium，启动本地测试网站验证表单和鼠标操作、上传下载、弹窗、结构化提取、精确等待、登录快照恢复、多标签页、iframe、Shadow DOM、截图坐标、会话隔离和取消清理；没有浏览器时明确跳过。`tests/test_browser_storage.py` 验证文件配额、失败清理与快照写入。测试不调用外部模型 API；截图结果另外经过 AstrBot 的真实工具执行器和 Agent 循环，验证图片进入下一次模型请求。
+
+`tests/test_browser_cdp.py` 使用临时用户数据目录启动独立调试浏览器，验证调试文件与端口校验、登录复用、页面范围、网络规则与弹窗、原生视口坐标、管理员权限及占用、失败与取消后的恢复、断线与退出清理，以及普通会话与共享渲染不受影响。自动连接测试覆盖默认目录和自定义目录、动态调试端口、授权等待与取消；Linux 安装 Xvfb、X11、XTest 时，还会在隔离虚拟桌面中启动没有远程调试命令行参数的 Chrome，验证原生授权拒绝、允许与断开后保留浏览器。缺少这些测试环境组件时仅跳过原生弹窗测试；插件运行无需这些组件。

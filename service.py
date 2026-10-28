@@ -482,13 +482,21 @@ class BrowserService:
         Raises:
             BrowserServiceError: The service is stopped or capacity is unavailable.
         """
+        async with self._capacity(headless=mode == "headless"):
+            yield await asyncio.wait_for(
+                self._ensure_browser(mode), timeout=self._browser_start_timeout
+            )
+
+    @asynccontextmanager
+    async def _capacity(self, *, headless: bool = False) -> AsyncIterator[None]:
+        """Share execution capacity with external clients without owning them."""
         if self._closing or self._closed:
             raise BrowserServiceError("浏览器服务不可用。")
         task = asyncio.current_task()
         registered = task is not None and task not in self._active_tasks
         if registered:
             self._active_tasks.add(task)
-        if mode == "headless":
+        if headless:
             self._headless_operations += 1
             self._touch_headless()
         acquired = False
@@ -502,15 +510,13 @@ class BrowserService:
             acquired = True
             if self._closing or self._closed:
                 raise BrowserServiceError("浏览器服务不可用。")
-            yield await asyncio.wait_for(
-                self._ensure_browser(mode), timeout=self._browser_start_timeout
-            )
+            yield
         finally:
             if acquired:
                 self._semaphore.release()
             if registered:
                 self._active_tasks.discard(task)
-            if mode == "headless":
+            if headless:
                 self._headless_operations -= 1
                 self._touch_headless()
 
