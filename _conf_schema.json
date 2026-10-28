@@ -26,7 +26,7 @@
         "description": "浏览器启动超时（秒）",
         "type": "int",
         "default": 30,
-        "hint": "允许 1～120。插件加载时启动并检查共用的 Chromium，BrowserUse 和离线渲染都依赖它。"
+        "hint": "允许 1～120。启用 BrowserUse 或共享渲染时，插件加载会启动并检查共用的 Chromium。"
       },
       "idle_shutdown_enabled": {
         "description": "空闲时关闭浏览器",
@@ -40,6 +40,18 @@
         "default": 1200,
         "condition": {"idle_shutdown_enabled": true},
         "hint": "允许 30～86400。所有无头会话和任务结束后开始计时；唤醒耗时计入请求超时。"
+      }
+    }
+  },
+  "render": {
+    "description": "共享渲染服务",
+    "type": "object",
+    "items": {
+      "enabled": {
+        "description": "启用共享渲染服务",
+        "type": "bool",
+        "default": true,
+        "hint": "向其他插件提供 HTML 截图、PDF 和临时页面接口。关闭后不影响 BrowserUse；两者都关闭时不初始化浏览器。"
       }
     }
   },
@@ -72,7 +84,7 @@
         "description": "允许按需使用有头浏览器",
         "type": "bool",
         "default": true,
-        "hint": "只有明确指定时才启动窗口，显示在 AstrBot 所在主机的图形桌面；最多一个有头实例和一个有头会话，用完释放。无头浏览器和渲染始终保持原模式。"
+        "hint": "明确指定时允许启动有头浏览器窗口，显示在 AstrBot 所在主机的图形桌面；最多一个有头实例和一个有头会话，用完释放。无头浏览器和渲染始终保持原模式。"
       },
       "max_sessions": {
         "description": "保留的 Agent 浏览器会话上限",

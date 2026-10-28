@@ -521,15 +521,22 @@ class BrowserServiceAPI:
     against malicious code running in the same process.
     """
 
-    __slots__ = ("__service",)
+    __slots__ = ("__service", "__enabled")
 
-    def __init__(self, service: BrowserService) -> None:
+    def __init__(self, service: BrowserService, *, enabled: bool = True) -> None:
         self.__service = service
+        self.__enabled = enabled
 
     @property
     def ready(self) -> bool:
         """Whether the managed service can accept a new request."""
-        return self.__service.ready
+        return self.__enabled and self.__service.ready
+
+    def _require_enabled(self) -> None:
+        if not self.__enabled:
+            raise BrowserServiceError(
+                "共享渲染服务已关闭。请在插件的共享渲染服务配置组中开启并重载插件。"
+            )
 
     @asynccontextmanager
     async def session(
@@ -541,6 +548,7 @@ class BrowserServiceAPI:
         timeout: int | float = 30,
     ) -> AsyncIterator[RenderPage]:
         """Yield a render wrapper and invalidate it on every session exit."""
+        self._require_enabled()
         async with self.__service.session(
             viewport=viewport,
             javascript_enabled=javascript_enabled,
@@ -565,6 +573,7 @@ class BrowserServiceAPI:
         max_pixels: int | None = MAX_SCREENSHOT_PIXELS,
     ) -> bytes:
         """Render offline HTML as PNG bytes."""
+        self._require_enabled()
         return await self.__service.render_html(
             html,
             viewport=viewport,
@@ -589,6 +598,7 @@ class BrowserServiceAPI:
         timeout: int | float = 30,
     ) -> bytes:
         """Render offline HTML as PDF bytes."""
+        self._require_enabled()
         return await self.__service.render_pdf(
             html,
             format=format,

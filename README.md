@@ -50,23 +50,11 @@
 | 模型 | 使用 BrowserUse 时需要支持工具调用；截图观察还需要支持图片输入 |
 | 图形桌面 | 仅有头模式需要，桌面位于 AstrBot 所在主机 |
 
-只使用渲染服务时，可以关闭 BrowserUse，无需配置模型工具。
-
 ### 2. 安装插件
 
-从插件市场安装本插件，或者在 AstrBot WebUI 的插件管理中，使用以下仓库地址安装：
+插件市场搜索 `浏览器服务` 或 `astrbot_plugin_browser`，点击安装即可。
 
-```text
-https://github.com/rytte/astrbot_plugin_browser
-```
-
-也可以将完整仓库目录放入 `AstrBot/data/plugins/astrbot_plugin_browser/`，在运行 AstrBot 的 Python 环境中安装依赖，再重载插件：
-
-```bash
-python -m pip install -r data/plugins/astrbot_plugin_browser/requirements.txt
-```
-
-插件加载时会自动按以下顺序准备 Chromium：
+启用 BrowserUse 或共享渲染服务时，插件加载会自动按以下顺序准备 Chromium：
 
 1. 使用 Playwright 已安装的 Chromium。
 2. 查找本机可用的 Chromium、Chrome、Edge、Brave、Vivaldi 或 Opera。
@@ -207,7 +195,8 @@ Chromium（浏览器实例）									# 150～300 MB
 
 | 配置位置 | 默认值 | 作用 |
 | --- | --- | --- |
-| BrowserUse → 启用 BrowserUse 模型工具 | 开启 | 关闭后仅保留供其他插件调用的渲染服务 |
+| 共享渲染服务 → 启用共享渲染服务 | 开启 | 控制其他插件的 HTML 截图、PDF 和临时页面接口，不影响 BrowserUse |
+| BrowserUse → 启用 BrowserUse 模型工具 | 开启 | 控制模型网页工具，不影响共享渲染服务的开关设置 |
 | BrowserUse → BrowserUse 白名单 | 空列表 | 空列表仅管理员可用；填写个人用户 ID 后向这些用户开放 |
 | BrowserUse → 模型工具层级 | 基础浏览（13 个工具） | 选择基础浏览、完整交互或高级控制 |
 | BrowserUse → 允许按需使用有头浏览器 | 开启 | 允许明确请求时启动窗口，需要主机有图形桌面 |

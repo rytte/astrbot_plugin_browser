@@ -7,6 +7,7 @@ import re
 from datetime import datetime, timezone
 from io import BytesIO
 from pathlib import Path
+from unittest.mock import AsyncMock, Mock
 
 import pytest
 from astrbot_plugin_browser.agent_browser import AgentBrowser
@@ -23,6 +24,27 @@ from astrbot_plugin_browser.service import (
 from PIL import Image
 from playwright.async_api import Locator, Page, async_playwright
 from playwright.async_api import TimeoutError as PlaywrightTimeoutError
+
+
+@pytest.mark.parametrize("operation", ["render_html", "render_pdf", "session"])
+async def test_disabled_render_api_rejects_requests_to_ready_browser(operation):
+    service = Mock(spec=BrowserService)
+    service.ready = True
+    service.render_html = AsyncMock()
+    service.render_pdf = AsyncMock()
+    api = BrowserServiceAPI(service, enabled=False)
+    # Cached entry points must reject calls even when callers omit ready checks.
+    call = getattr(api, operation)
+    assert api.ready is False
+    with pytest.raises(BrowserServiceError, match="共享渲染服务已关闭"):
+        if operation == "session":
+            async with call():
+                pytest.fail("Disabled rendering must not create a session")
+        else:
+            await call("<p>blocked</p>")
+    service.render_html.assert_not_awaited()
+    service.render_pdf.assert_not_awaited()
+    service.session.assert_not_called()
 
 
 @pytest.fixture

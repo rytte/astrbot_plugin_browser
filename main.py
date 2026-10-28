@@ -24,12 +24,12 @@ class BrowserPlugin(Star):
     def __init__(self, context: Context, config: AstrBotConfig):
         super().__init__(context)
         settings = dict(config)
-        unknown = set(settings) - {"browser", "browser_use"}
+        unknown = set(settings) - {"browser", "browser_use", "render"}
         if unknown:
             raise BrowserServiceError(
                 "未知插件配置："
                 + ", ".join(sorted(unknown))
-                + "。共用配置请放入 browser 配置组，BrowserUse 专用配置请放入 browser_use 配置组。"
+                + "。共用配置请放入 browser 配置组，BrowserUse 专用配置请放入 browser_use 配置组，渲染配置请放入 render 配置组。"
             )
         browser = settings.get("browser", {})
         if not isinstance(browser, dict):
@@ -47,6 +47,18 @@ class BrowserPlugin(Star):
                 "未知浏览器基础配置："
                 + ", ".join(f"browser.{key}" for key in sorted(unknown))
             )
+        render = settings.get("render", {})
+        if not isinstance(render, dict):
+            raise BrowserServiceError("render 必须是配置对象。")
+        unknown = set(render) - {"enabled"}
+        if unknown:
+            raise BrowserServiceError(
+                "未知共享渲染配置："
+                + ", ".join(f"render.{key}" for key in sorted(unknown))
+            )
+        self.render_enabled = render.get("enabled", True)
+        if type(self.render_enabled) is not bool:
+            raise BrowserServiceError("render.enabled 必须是布尔值。")
         browser_use = settings.get("browser_use", {})
         if not isinstance(browser_use, dict):
             raise BrowserServiceError("browser_use 必须是配置对象。")
@@ -84,7 +96,7 @@ class BrowserPlugin(Star):
             idle_shutdown_enabled=browser.get("idle_shutdown_enabled", False),
             idle_shutdown_timeout=browser.get("idle_shutdown_timeout", 1200),
         )
-        self.service = BrowserServiceAPI(self._service)
+        self.service = BrowserServiceAPI(self._service, enabled=self.render_enabled)
         self.agent = AgentBrowser(
             self._service,
             max_sessions=browser_use.get("max_sessions", 4),
@@ -97,7 +109,7 @@ class BrowserPlugin(Star):
         self._tool_tasks: set[asyncio.Task] = set()
 
     async def initialize(self) -> None:
-        """Start the configured browser and make the service available."""
+        """Start the browser only when browsing or rendering is enabled."""
         # Remove definitions entirely without changing AstrBot's persisted
         # per-tool activation choices. Reloading re-registers the decorators.
         manager = self.context.get_llm_tool_manager()
@@ -107,10 +119,17 @@ class BrowserPlugin(Star):
                 not self.browser_use_enabled or tool.name not in allowed
             ):
                 manager.remove_func(tool.name)
+        if not (self.render_enabled or self.browser_use_enabled):
+            self.logger.info("BrowserUse and shared rendering are disabled")
+            return
         await self._service.initialize()
         if self.browser_use_enabled:
             self.agent.start()
-        self.logger.info("Shared browser service is ready")
+        self.logger.info(
+            "Browser initialized (BrowserUse=%s, shared rendering=%s)",
+            self.browser_use_enabled,
+            self.render_enabled,
+        )
 
     async def terminate(self) -> None:
         """Stop active sessions and release the browser process."""

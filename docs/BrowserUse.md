@@ -20,7 +20,9 @@ BrowserUse 向模型提供联网网页操作工具。本文说明权限、个人
 | `browser_use.idle_timeout` | `600` 秒 | 30～3600 | Agent 会话空闲回收时间 |
 | `browser_use.action_timeout` | `30` 秒 | 1～120 | 单次 Agent 工具总时限，包括排队、操作和观察 |
 
-保存配置后重载插件生效。关闭 BrowserUse 后，全部 `browser_*` 工具从可用工具列表中移除，工具定义不会发送给模型；缓存的直接调用也会返回 `BROWSER_USE_DISABLED`。重载会自动保存原有 Agent 会话的登录状态后关闭会话，并清理个人临时文件；已保存的登录快照保留。离线渲染服务仍然可用，工具管理中的单项启停设置保持不变。
+保存配置后重载插件生效。关闭 BrowserUse 后，全部 `browser_*` 工具从可用工具列表中移除，工具定义不会发送给模型；缓存的直接调用也会返回 `BROWSER_USE_DISABLED`。重载会自动保存原有 Agent 会话的登录状态后关闭会话，并清理个人临时文件；已保存的登录快照保留。离线渲染由独立的 `render.enabled` 控制，工具管理中的单项启停设置保持不变。
+
+`render.enabled` 默认开启，关闭共享渲染不影响 BrowserUse。两者都关闭时，插件不初始化浏览器，也不触发 Chromium 自动安装。
 
 浏览器路径、执行并发、排队、启动及实例空闲关闭属于共用的 `browser` 组，见[共享浏览器配置](./共享浏览器.md#configuration)。
 

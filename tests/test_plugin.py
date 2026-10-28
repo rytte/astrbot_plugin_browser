@@ -64,6 +64,7 @@ def test_plugin_owns_one_configured_service():
         },
     )
 
+    assert plugin.render_enabled is True
     assert plugin._service.max_concurrent_sessions == 3
     assert plugin._service.queue_timeout == 20
     assert plugin._service.startup_timeout == 15
@@ -78,6 +79,23 @@ def test_plugin_owns_one_configured_service():
 def test_plugin_rejects_unknown_settings():
     with pytest.raises(BrowserServiceError, match="未知插件配置"):
         BrowserPlugin(SimpleNamespace(), {"unrecognized": True})
+
+
+@pytest.mark.parametrize(
+    ("config", "error"),
+    [
+        ({"render": None}, "render 必须是配置对象"),
+        ({"render": False}, "render 必须是配置对象"),
+        ({"render": []}, "render 必须是配置对象"),
+        ({"render": {"unknown": True}}, "未知共享渲染配置.*render.unknown"),
+        ({"render": {"enabled": "false"}}, "render.enabled 必须是布尔值"),
+        ({"render": {"enabled": 0}}, "render.enabled 必须是布尔值"),
+        ({"render": {"enabled": None}}, "render.enabled 必须是布尔值"),
+    ],
+)
+def test_plugin_rejects_invalid_render_settings(config, error):
+    with pytest.raises(BrowserServiceError, match=error):
+        BrowserPlugin(SimpleNamespace(), config)
 
 
 @pytest.mark.parametrize(
@@ -149,7 +167,7 @@ def test_plugin_rejects_old_or_invalid_browser_use_config(config, error):
         BrowserPlugin(SimpleNamespace(), config)
 
 
-def test_schema_loads_both_configuration_groups(tmp_path):
+def test_schema_loads_configuration_groups(tmp_path):
     from astrbot.api import AstrBotConfig
 
     schema = json.loads(
@@ -165,6 +183,7 @@ def test_schema_loads_both_configuration_groups(tmp_path):
             "idle_shutdown_enabled": False,
             "idle_shutdown_timeout": 1200,
         },
+        "render": {"enabled": True},
         "browser_use": {
             "enabled": True,
             "headed_enabled": True,
@@ -176,6 +195,7 @@ def test_schema_loads_both_configuration_groups(tmp_path):
         },
     }
     plugin = BrowserPlugin(SimpleNamespace(), config)
+    assert plugin.render_enabled is True
     assert plugin.browser_use_enabled is True
     assert plugin.agent.tool_level == "basic"
     assert plugin._service.idle_shutdown_enabled is False
@@ -283,6 +303,48 @@ async def test_plugin_lifecycle_delegates_to_service(tool_manager):
     await plugin.terminate()
 
     plugin._service.initialize.assert_awaited_once()
+    plugin._service.close.assert_awaited_once()
+
+
+@pytest.mark.parametrize("render_enabled", [True, False])
+@pytest.mark.parametrize("browser_use_enabled", [True, False])
+async def test_render_and_browser_use_switches_are_independent(
+    tool_manager, render_enabled, browser_use_enabled
+):
+    plugin = BrowserPlugin(
+        SimpleNamespace(get_llm_tool_manager=lambda: tool_manager),
+        {
+            "render": {"enabled": render_enabled},
+            "browser_use": {"enabled": browser_use_enabled},
+        },
+    )
+
+    async def initialize_browser():
+        plugin._service._browser = Mock(is_connected=Mock(return_value=True))
+
+    plugin._service.initialize = AsyncMock(side_effect=initialize_browser)
+    plugin._service.close = AsyncMock()
+    plugin.agent.execute = AsyncMock(return_value=BrowserResult({"success": True}))
+    try:
+        await plugin.initialize()
+        if render_enabled or browser_use_enabled:
+            plugin._service.initialize.assert_awaited_once()
+            assert plugin._service.ready
+        else:
+            plugin._service.initialize.assert_not_awaited()
+            assert not plugin._service.ready
+            assert plugin._service._playwright is None
+        assert plugin.service.ready is render_enabled
+        assert (plugin.agent._reaper is not None) is browser_use_enabled
+        assert bool(tool_manager.func_list) is browser_use_enabled
+        result = await plugin.browser_open(event(), url="https://example.test")
+        assert result.isError is (not browser_use_enabled)
+        if browser_use_enabled:
+            plugin.agent.execute.assert_awaited_once()
+        else:
+            plugin.agent.execute.assert_not_awaited()
+    finally:
+        await plugin.terminate()
     plugin._service.close.assert_awaited_once()
 
 
