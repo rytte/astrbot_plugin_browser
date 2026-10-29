@@ -104,12 +104,16 @@
 
 通过 CDP 可以连接 **AstrBot 所在主机**上正在使用的 Chrome / Edge 等 Chromium 内核浏览器，操作新页面或已有页面。
 
-此功能默认关闭，仅允许 AstrBot 管理员使用。要求：`Chromium 内核版本 >= 144`。
+此功能默认关闭，仅允许 AstrBot 管理员使用。
 
-1. 在已打开的浏览器地址栏输入 `chrome://inspect/#remote-debugging` 并回车，在页面中启用远程调试（`Allow remote debugging for this browser instance`），无需重启浏览器。
-2. 从地址栏进入 `chrome://version` 页面，找到 `用户配置路径（Edge） / 个人资料路径（Chrome）`，复制路径，去掉最后的 `/Default`。
-3. 在插件配置中打开 **允许连接本地浏览器（CDP）** ，将上一步的路径填入 **Chrome 用户数据根目录（可选）** 配置，保存并重载。
-4. 对机器人说：“连接我当前使用的本地浏览器，列出已有页面，等我选择后再操作。” 连接时在浏览器弹出的**授权窗口中点击允许**。
+1. 在插件配置中打开 **允许连接本地浏览器（CDP）**，保存并重载。
+2. 在已打开的浏览器地址栏输入 `chrome://inspect/#remote-debugging` 并回车，在页面中启用远程调试（`Allow remote debugging for this browser instance`），无需重启浏览器。
+3. 对机器人说：“连接本地浏览器”，连接时在浏览器弹出的**授权窗口中点击允许**。
+
+**可选配置说明**
+
+* **本地浏览器调试地址（可选）**：在 `chrome://inspect/#remote-debugging` 页面中勾选启用远程调试时下面会弹出一行 **Server running at: `127.0.0.1:9222`**，插件通常会优先连接该地址，如果显示的端口并非 `9222`（例如 `127.0.0.1:41063`），并且出现连不上的情况，可以尝试将该地址填入该配置。
+* **浏览器用户数据根目录（可选）**：对于 Chrome、Edge、Chromium ，插件会默认查找该标准数据目录。对于其他浏览器/ 查找失败 / 发现多个浏览器调试信息的情况，可以手动填写该配置。从地址栏进入 `chrome://version` 页面，找到 `用户配置路径（Edge） / 个人资料路径（Chrome）`，复制路径，去掉最后的 `/Default`，填入该配置。
 
 > Docker 中的本机地址指容器自身，默认无法直接连接宿主机 Chrome。
 >
@@ -203,7 +207,7 @@ Chromium（浏览器实例）									# 150～300 MB
 | `render_pdf()` | PDF 字节，可保存或交给文件消息组件 |
 | `session()` | 自动清理的受限页面，供调用方排版、测量和截图 |
 
-`session()` 返回 `RenderPage`，`locator()` 返回 `RenderLocator`；它们只公开必要的渲染方法，不提供原生 Page、Context 或 Browser 的关联访问，也不接受本机文件路径。支持操作超时、截图质量与裁剪、元素链式定位等常用渲染能力；需要文件时由调用方保存返回的字节。依赖原生 Playwright 对象的调用需要调整。
+`session()` 返回 `RenderPage`，`locator()` 返回 `RenderLocator`；它们只公开必要的渲染方法，不提供原生 Page、Context 或 Browser 的关联访问，也不接受本机文件路径。支持操作超时、截图质量与裁剪、元素链式定位等常用渲染能力；需要文件时由调用方保存返回的字节。
 
 渲染接口拦截页面的外部资源请求，HTML 中的 CSS、图片和字体应内联。开启空闲关闭后，这些接口会自动唤醒浏览器。
 

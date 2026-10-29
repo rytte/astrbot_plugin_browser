@@ -170,10 +170,6 @@ def test_plugin_reads_grouped_browser_use_settings():
         ),
         ({"browser_use": {"cdp": {"user_id": None}}}, "user_id 必须是"),
         (
-            {"browser_use": {"cdp": {"endpoint": "http://example.com:9222"}}},
-            "未知 CDP 配置",
-        ),
-        (
             {"browser_use": {"cdp": {"allow_existing_tabs": 1}}},
             "allow_existing_tabs 必须是布尔值",
         ),
@@ -209,6 +205,7 @@ def test_schema_loads_configuration_groups(tmp_path):
             "headed_enabled": True,
             "cdp": {
                 "enabled": False,
+                "endpoint": "",
                 "user_data_dir": "",
                 "user_id": "",
                 "allow_existing_tabs": True,
@@ -221,6 +218,7 @@ def test_schema_loads_configuration_groups(tmp_path):
         },
     }
     plugin = BrowserPlugin(SimpleNamespace(), config)
+    assert plugin.agent.cdp.endpoint == ""
     assert plugin.render_enabled is True
     assert plugin.browser_use_enabled is True
     assert plugin.agent.tool_level == "basic"
@@ -383,6 +381,42 @@ def event(sender="alice", origin="test:group:one", *, admin=True):
     )
 
 
+@pytest.mark.parametrize("enabled", [False, True])
+@pytest.mark.parametrize(
+    "endpoint",
+    [None, 123, "ws://127.0.0.1:41063/devtools/page/id", "http://example.com:9222"],
+)
+async def test_invalid_cdp_address_does_not_prevent_plugin_loading(
+    tool_manager, monkeypatch, enabled, endpoint
+):
+    start = Mock(side_effect=AssertionError("Do not connect an invalid CDP address"))
+    monkeypatch.setattr("astrbot_plugin_browser.browser_cdp.async_playwright", start)
+    plugin = BrowserPlugin(
+        SimpleNamespace(get_llm_tool_manager=lambda: tool_manager),
+        {"browser_use": {"cdp": {"enabled": enabled, "endpoint": endpoint}}},
+    )
+    plugin._service.initialize = AsyncMock()
+    plugin._service.close = AsyncMock()
+    try:
+        await plugin.initialize()
+        plugin._service.initialize.assert_awaited_once()
+        assert plugin.agent._reaper is not None
+        status = await plugin.browser_mode(event(), mode="status")
+        assert not status.isError
+        assert json.loads(status.content[0].text)["mode"] == "headless"
+        result = await plugin.browser_mode(event(), mode="cdp")
+        assert result.isError
+        assert json.loads(result.content[0].text)["error"]["code"] == (
+            "CDP_INVALID_ENDPOINT" if enabled else "CDP_DISABLED"
+        )
+        assert plugin.agent._cdp_owner is None
+        assert not plugin.agent._creating
+        start.assert_not_called()
+        assert not (await plugin.browser_mode(event(), mode="status")).isError
+    finally:
+        await plugin.terminate()
+
+
 @pytest.mark.parametrize(
     ("cdp_settings", "restricted"),
     [
@@ -404,6 +438,7 @@ async def test_cdp_requires_admin_and_optional_user_id_on_every_call(
             "browser_use": {
                 "cdp": {
                     "enabled": True,
+                    "endpoint": "http://localhost:41063/",
                     "user_data_dir": str(tmp_path),
                     **cdp_settings,
                 },
@@ -413,6 +448,7 @@ async def test_cdp_requires_admin_and_optional_user_id_on_every_call(
         },
     )
     assert plugin.agent.cdp.user_data_dir == tmp_path
+    assert plugin.agent.cdp.endpoint == "http://localhost:41063/"
     plugin.agent.execute = AsyncMock(return_value=BrowserResult({"success": True}))
     plugin._import_attachments = AsyncMock(return_value=[])
     current = event(sender=sender, admin=admin)

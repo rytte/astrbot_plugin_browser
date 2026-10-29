@@ -85,6 +85,7 @@ class BrowserPlugin(Star):
             raise BrowserServiceError("browser_use.cdp 必须是配置对象。")
         unknown = set(cdp) - {
             "enabled",
+            "endpoint",
             "user_data_dir",
             "user_id",
             "allow_existing_tabs",
@@ -127,6 +128,7 @@ class BrowserPlugin(Star):
             tool_level=browser_use.get("tool_level", "basic"),
             headed_enabled=browser_use.get("headed_enabled", True),
             cdp_enabled=cdp.get("enabled", False),
+            cdp_endpoint=cdp.get("endpoint", ""),
             cdp_user_data_dir=cdp.get("user_data_dir", ""),
             cdp_allow_existing_tabs=cdp.get("allow_existing_tabs", True),
         )
@@ -335,10 +337,10 @@ class BrowserPlugin(Star):
     async def browser_mode(
         self, event: AstrMessageEvent, mode: str = "status"
     ) -> CallToolResult:
-        """查询或切换个人浏览器模式。默认无头，用户明确需要可见窗口时才切换 headed。窗口位于 AstrBot 主机。cdp 仅在用户明确要求连接本机已有浏览器时使用，需管理员开启；使用者 ID 留空允许任意管理员，填写后仅允许对应管理员；自动连接当前 Chrome 时用户需在浏览器授权窗口点击允许，失败后不自动重试。进入时只新建标签页，如需操作现有页面用 browser_tabs 的 available/attach 明确选择。使用外部浏览器自身登录，进入或退出 CDP 均不迁移登录状态。普通有头/无头切换保留登录存储但重建页面。关闭会话后默认回到无头。
+        """查询或切换个人浏览器模式。默认无头，用户明确需要可见窗口时才切换 headed。窗口位于 AstrBot 主机。cdp 仅在用户明确要求连接本机已有浏览器时使用，需管理员开启；使用者 ID 留空允许任意管理员，填写后仅允许对应管理员；连接 Chrome、Edge 或 Chromium 时优先使用配置的调试地址，未填写则自动发现；用户需在浏览器弹出授权窗口时点击允许，失败后不自动重试。进入时只新建标签页，如需操作现有页面用 browser_tabs 的 available/attach 明确选择。使用外部浏览器自身登录，进入或退出 CDP 均不迁移登录状态。普通有头/无头切换保留登录存储但重建页面。关闭会话后默认回到无头。
 
         Args:
-            mode(string): status 查询且不启动浏览器；headed 切换有头；headless 切回无头；cdp 显式自动发现并连接当前 Chrome。
+            mode(string): status 查询且不启动浏览器；headed 切换有头；headless 切回无头；cdp 显式连接本机 Chrome、Edge 或 Chromium，优先使用配置的调试地址，否则按用户数据目录自动发现。
         """
         return await self._tool(event, "mode", mode=mode)
 

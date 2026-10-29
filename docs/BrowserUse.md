@@ -16,15 +16,16 @@ BrowserUse 向模型提供联网网页操作工具。本文说明权限、个人
 | `browser_use.user_whitelist` | `[]` | 用户 ID 字符串列表 | 个人白名单，与管理员同权限，私聊及任意群聊均可用；空列表仅允许管理员 |
 | `browser_use.tool_level` | `basic` | `basic` / `standard` / `full` | 基础浏览 13 个、完整交互 19 个、高级控制 23 个工具，高层包含低层全部工具 |
 | `browser_use.headed_enabled` | `true` | 布尔值 | 允许明确请求时启动有头窗口；最多一个有头实例及会话 |
-| `browser_use.cdp.enabled` | `false` | 布尔值 | 明确请求时自动发现当前 Chrome 144+，等待浏览器授权后连接 |
-| `browser_use.cdp.user_data_dir` | 空 | 用户数据根目录 | 自动连接时可指定绝对路径；留空定位稳定版 Chrome 的默认目录 |
+| `browser_use.cdp.enabled` | `false` | 布尔值 | 明确请求时自动发现 Chrome、Edge 或 Chromium，等待浏览器授权后连接 |
+| `browser_use.cdp.endpoint` | 空 | 本机调试 URL | 留空自动发现；支持省略协议、HTTP(S) 或 WebSocket 地址；仅连接指定主机和端口 |
+| `browser_use.cdp.user_data_dir` | 空 | 用户数据根目录 | 可指定绝对路径；用于自动发现或补齐 WebSocket 路径；留空查找浏览器常见目录，多目标时需指定 |
 | `browser_use.cdp.user_id` | 空 | 个人用户 ID | 留空允许任意 AstrBot 管理员使用；填写后仅允许该 ID 对应的管理员使用 |
 | `browser_use.cdp.allow_existing_tabs` | `true` | 布尔值 | 允许列出并明确选择接入已有标签页；默认只管理插件新建的页面 |
 | `browser_use.max_sessions` | `4` | 1～16 | 同时保留的 Agent 联网会话上限，与执行并发分别限制 |
 | `browser_use.idle_timeout` | `600` 秒 | 30～3600 | Agent 会话空闲回收时间 |
 | `browser_use.action_timeout` | `30` 秒 | 1～120 | 单次 Agent 工具总时限，包括排队、操作和观察 |
 
-CDP 选项位于 `browser_use.cdp`，仅保留 `enabled`、`user_id`、`allow_existing_tabs` 和 `user_data_dir` 四项。保存配置后重载插件生效。关闭 BrowserUse 后，全部 `browser_*` 工具从可用工具列表中移除，工具定义不会发送给模型；缓存的直接调用也会返回 `BROWSER_USE_DISABLED`。重载会自动保存原有 Agent 会话的登录状态后关闭会话，并清理个人临时文件；已保存的登录快照保留。离线渲染由独立的 `render.enabled` 控制，工具管理中的单项启停设置保持不变。
+CDP 选项位于 `browser_use.cdp`，包含 `enabled`、`endpoint`、`user_data_dir`、`user_id` 和 `allow_existing_tabs` 五项。保存配置后重载插件生效。关闭 BrowserUse 后，全部 `browser_*` 工具从可用工具列表中移除，工具定义不会发送给模型；缓存的直接调用也会返回 `BROWSER_USE_DISABLED`。重载会自动保存原有 Agent 会话的登录状态后关闭会话，并清理个人临时文件；已保存的登录快照保留。离线渲染由独立的 `render.enabled` 控制，工具管理中的单项启停设置保持不变。
 
 `render.enabled` 默认开启，关闭共享渲染不影响 BrowserUse。两者都关闭时，插件不初始化浏览器，也不触发 Chromium 自动安装。
 
@@ -214,34 +215,49 @@ browser_mode(mode="headless")   # 可选：在内存中交接回无头，随后�
 
 ## 🔌 本地浏览器控制（CDP）
 
-CDP 模式自动发现并连接 **AstrBot 所在主机**上正在使用的 Chrome 144+，复用该浏览器自己的 Cookie、Local Storage 和登录状态。它不能直接控制聊天用户另一台电脑上的浏览器；Docker 部署时，回环地址指容器自身。此功能默认关闭，沿用已有 Playwright 依赖，无需额外 Python 包。
+CDP 模式自动发现并连接 **AstrBot 所在主机**上正在使用的 Chrome、Edge 或 Chromium，复用该浏览器自己的 Cookie、Local Storage 和登录状态。它不能直接控制聊天用户另一台电脑上的浏览器；Docker 部署时，回环地址指容器自身。此功能默认关闭，沿用已有 Playwright 依赖，无需额外 Python 包。
 
-### 连接正在使用的普通 Chrome
+### 连接正在使用的本地浏览器
 
-Chrome 144 及以上支持在浏览器运行期间开启远程调试，连接后保留当前用户资料、登录状态和已有页面，无需重新启动浏览器或另外登录。
+Chrome 144 及以上支持在浏览器运行期间开启远程调试，连接后保留当前用户资料、登录状态和已有页面，无需重新启动浏览器或另外登录。Edge、Chromium 也支持标准目录发现，但需要所用版本提供远程调试开关、发布 `DevToolsActivePort` 文件，并支持相应的连接授权；仅有 Chromium 内核版本号不能保证这些功能均可用。
 
-1. 在正在使用的 Chrome 中打开 `chrome://inspect/#remote-debugging`，启用远程调试。
+1. 在正在使用的浏览器中打开 `chrome://inspect/#remote-debugging`（Edge 使用 `edge://inspect/#remote-debugging`），启用远程调试。
 2. 在 BrowserUse → 本地浏览器控制（CDP）子配置组中开启 `enabled`，保存后重载插件。`user_id`（使用者的个人 ID）留空允许任意 AstrBot 管理员使用；填写后仅允许该 ID 对应的管理员使用。BrowserUse 白名单不授予 CDP 权限。若要操作已经打开的页面，确认 `allow_existing_tabs` 已开启（默认开启）。
-3. 明确请求连接当前浏览器，触发 `browser_mode(mode="cdp")`；随后在 Chrome 弹出的调试连接授权窗口中点击允许。授权由 Chrome 控制，插件不会代为开启开关或接受授权。
+3. 明确请求连接当前浏览器，触发 `browser_mode(mode="cdp")`；随后在浏览器弹出的调试连接授权窗口中点击允许。授权由浏览器控制，插件不会代为开启开关或接受授权。
 4. 使用下文的 `available` 和 `attach` 选择要操作的现有标签页。
 
-自动连接从 Chrome 用户数据根目录读取 `DevToolsActivePort`，仅连接其中的回环 WebSocket 地址，不启动浏览器、不修改用户资料。插件加载和状态查询均不读取此文件或发起授权请求；每次重新连接都会重新读取，适应 Chrome 更换调试端口。
+`endpoint` 留空时，自动连接从浏览器用户数据根目录读取 `DevToolsActivePort`，仅连接其中的回环 WebSocket 地址，不启动浏览器、不修改用户资料。插件加载和状态查询均不读取此文件或发起授权请求；每次重新连接都会重新读取，适应浏览器更换调试端口。
 
-`user_data_dir` 留空时使用运行 AstrBot 的系统账户下稳定版 Chrome 的默认目录：
+`endpoint` 与 `user_data_dir` 均留空时检查运行 AstrBot 的系统用户下以下标准目录，仅在调用 `browser_mode(mode="cdp")` 时读取调试文件：
 
-| 系统 | 默认用户数据根目录 |
-| --- | --- |
-| Linux | `~/.config/google-chrome`（尊重 `CHROME_CONFIG_HOME`、`XDG_CONFIG_HOME`） |
-| macOS | `~/Library/Application Support/Google/Chrome` |
-| Windows | `%LOCALAPPDATA%\Google\Chrome\User Data` |
+| 系统 | Chrome | Edge | Chromium |
+| --- | --- | --- | --- |
+| Linux | `~/.config/google-chrome` | `~/.config/microsoft-edge` | `~/.config/chromium` |
+| macOS | `~/Library/Application Support/Google/Chrome` | `~/Library/Application Support/Microsoft Edge` | `~/Library/Application Support/Chromium` |
+| Windows | `%LOCALAPPDATA%\Google\Chrome\User Data` | `%LOCALAPPDATA%\Microsoft\Edge\User Data` | `%LOCALAPPDATA%\Chromium\User Data` |
 
-Chrome 使用自定义目录、Beta/Dev/Canary 或 Chromium 时，在 `user_data_dir` 填写实际绝对路径（支持 `~`）。可从 `chrome://version` 查看“个人资料路径”，填写其上一级用户数据目录，例如 `…/google-chrome`，**不要填写 `Default` 或 `Profile 1` 子目录**。多实例时通过此目录明确选择浏览器；不会扫描其他账户的目录或任选一个实例。AstrBot 需具备读取该文件的权限，并能连接 Chrome 的本机端口；Docker 默认无法直接连接宿主机 Chrome。
+Linux 上三者均尊重 `XDG_CONFIG_HOME`，Chrome 还优先使用 `CHROME_CONFIG_HOME`；另检查 `~/snap/chromium/common/chromium` 和 `~/.var/app/` 下 Chrome、Edge、Chromium 的常见 Flatpak 数据目录。仅有一个目录包含有效调试信息时才连接；多个目录均包含时返回 `CDP_MULTIPLE_BROWSERS`，需填写 `user_data_dir` 或 `endpoint` 明确选择。发现阶段不探测端口或尝试连接，因此浏览器退出后残留的有效调试文件也可能计入候选；遇到此情况同样可填写目标目录。
 
-默认单次工具总时限为 30 秒，包含等待浏览器授权；需要更多操作时间可把 `browser_use.action_timeout` 调至 60～120 秒，并确保 AstrBot 的工具调用时限足够。找不到调试文件返回 `CDP_DISCOVERY_FAILED`；浏览器拒绝、退出或连接失败返回 `CDP_CONNECTION_FAILED`，整体超时返回 `TIMEOUT`。启用开关、允许连接或修正配置后需明确重新请求，不会自动重试或重启 Chrome。
+使用自定义目录、Beta/Dev/Canary 或其他未覆盖的安装目录时，在 `user_data_dir` 填写实际绝对路径（支持 `~`）。可从 `chrome://version`（Edge 使用 `edge://version`）查看“个人资料路径”，填写其上一级用户数据目录，例如 `…/google-chrome`，**不要填写 `Default` 或 `Profile 1` 子目录**。多实例时通过此目录明确选择浏览器；不会扫描其他账户的目录或任选一个实例。AstrBot 需具备读取该文件的权限，并能连接浏览器的本机端口；Docker 默认无法直接连接宿主机 Chrome。
+
+默认单次工具总时限为 30 秒，包含等待浏览器授权；需要更多操作时间可把 `browser_use.action_timeout` 调至 60～120 秒，并确保 AstrBot 的工具调用时限足够。找不到调试文件返回 `CDP_DISCOVERY_FAILED`；浏览器拒绝、退出或连接失败返回 `CDP_CONNECTION_FAILED`，整体超时返回 `TIMEOUT`。启用开关、允许连接或修正配置后需明确重新请求，不会自动重试或重启浏览器。
 
 参考：[Chrome 官方的当前会话连接说明](https://developer.chrome.com/blog/chrome-devtools-mcp-debug-your-browser-session)。
 
-调试地址由 Chrome 发布文件自动发现，固定连接本机回环地址，工具参数不接受调试地址或用户数据目录。无需配置端口、Node.js、MCP 服务或额外 Python 包。
+### 手动填写调试地址
+
+如果自动发现不可靠，可以在“本地浏览器调试地址”（`browser_use.cdp.endpoint`）中填写浏览器当前的调试地址，例如：
+
+- `127.0.0.1:41063`：省略协议时，先从候选目录的调试文件中匹配端口并补齐 WebSocket 路径；没有匹配时，再尝试该主机和端口的 HTTP `/json/version` 接口。若匹配到多个不同路径则报错，不会尝试 HTTP；已找到路径但连接失败时也不会重试。
+- `http://127.0.0.1:41063`：插件读取该地址的 `/json/version` 获取浏览器连接路径，也接受以 `/json/version` 结尾的地址。目标浏览器必须提供此 HTTP 接口；新版“当前会话调试”可能不提供，此时可填写下面的简写 WebSocket 地址，由插件自动读取路径。
+- `ws://127.0.0.1:41063`：只填写主机和端口。插件读取候选目录中的 `DevToolsActivePort`，仅使用端口为 `41063` 的浏览器路径，并保留你填写的主机、端口和协议。也接受以 `/`、`/devtools/browser` 或 `/devtools/browser/` 结尾的简写。
+- `ws://127.0.0.1:41063/devtools/browser/实际浏览器ID`：已知完整路径时直接连接，不读取调试文件。
+
+支持 `http`、`https`、`ws`、`wss`；只填 `127.0.0.1:41063`、`localhost:41063` 或 `[::1]:41063` 时自动选择文件匹配或 HTTP 发现。已知完整 `/devtools/browser/…` 路径时也可省略 `ws://`，直接填写 `127.0.0.1:41063/devtools/browser/实际浏览器ID`。显式填写协议则按指定方式处理；使用 TLS 时需保留 `https://` 或 `wss://`。主机仅支持本机回环 IP 或 `localhost`。HTTP 发现不使用代理、不跟随重定向，返回的 WebSocket 地址也必须指向本机。填写 HTTP 地址或完整 WebSocket 地址时不读取用户数据目录；WebSocket 简写或省略协议的主机和端口则读取指定的 `user_data_dir`，未指定时检查上述浏览器常见目录。显式 WebSocket 简写找不到匹配端口时返回 `CDP_DISCOVERY_FAILED`，同一端口匹配到多个不同路径返回 `CDP_MULTIPLE_BROWSERS`，可填写目标用户数据目录解决。不会连接其他端口的浏览器，连接失败不会回退。浏览器重启可能改变端口或浏览器 ID；简写地址每次重新连接都会重新读取路径，端口变化时仍需更新地址并重载插件，完整地址则需同时更新 ID。地址留空则恢复自动发现。
+
+调试地址在实际连接时才校验；格式错误返回 `CDP_INVALID_ENDPOINT`，不会阻止插件加载，也不影响普通浏览和共享渲染。修改地址后保存并重载插件即可重试，或清空地址恢复自动发现。
+
+填写地址同样仅在明确调用 `browser_mode(mode="cdp")` 后发起连接，仍校验管理员权限，并遵循目标浏览器的授权流程；不会启动、重启浏览器或替用户接受授权。调试地址与用户数据目录只由管理员配置，工具参数不接受这些值，无需 Node.js、MCP 服务或额外 Python 包。
 
 ### 使用和标签页范围
 
@@ -391,7 +407,9 @@ BrowserUse 工具失败返回 `success=false` 以及 `error.code`、`error.messa
 | `HEADED_DISABLED` / `HEADED_BUSY` | 有头入口关闭或被其他会话占用，调整配置或稍后重试 |
 | `CDP_DISABLED` / `CDP_PERMISSION_DENIED` | CDP 未启用、当前用户不是管理员，或不匹配配置的使用者 ID |
 | `CDP_BUSY` | 外部浏览器被另一聊天会话占用，先结束该会话 |
-| `CDP_DISCOVERY_FAILED` | 检查 Chrome 远程调试开关、用户数据根目录和文件读取权限 |
+| `CDP_INVALID_ENDPOINT` | 调试地址格式无效；修正或清空 `endpoint` 后保存并重载插件，其他功能不受影响 |
+| `CDP_DISCOVERY_FAILED` | 检查浏览器远程调试开关、用户数据根目录和文件读取权限 |
+| `CDP_MULTIPLE_BROWSERS` | 自动发现有多个目标，或简写 WebSocket 的端口匹配多个路径；填写 `user_data_dir` 或完整地址明确选择目标 |
 | `CDP_CONNECTION_FAILED` / `CDP_DISCONNECTED` | 检查浏览器授权、远程调试开关及进程，明确请求重新接入 |
 | `CDP_EXISTING_TABS_DISABLED` / `CDP_UNSUPPORTED` | 未允许接入已有页面，或当前操作不适用于外部浏览器 |
 | `SESSION_EXPIRED` / `NO_SESSION` | 会话已回收或尚未创建，需要重新打开网址 |
@@ -434,4 +452,4 @@ BrowserUse 工具失败返回 `success=false` 以及 `error.code`、`error.messa
 
 `tests/test_agent_browser.py` 自动选择已安装的 Chromium，启动本地测试网站验证表单和鼠标操作、上传下载、弹窗、结构化提取、精确等待、登录快照恢复、多标签页、iframe、Shadow DOM、截图坐标、会话隔离和取消清理；没有浏览器时明确跳过。`tests/test_browser_storage.py` 验证文件配额、失败清理与快照写入。测试不调用外部模型 API；截图结果另外经过 AstrBot 的真实工具执行器和 Agent 循环，验证图片进入下一次模型请求。
 
-`tests/test_browser_cdp.py` 使用临时用户数据目录启动独立调试浏览器，验证调试文件与端口校验、登录复用、页面范围、网络规则与弹窗、原生视口坐标、管理员权限及占用、失败与取消后的恢复、断线与退出清理，以及普通会话与共享渲染不受影响。自动连接测试覆盖默认目录和自定义目录、动态调试端口、授权等待与取消；Linux 安装 Xvfb、X11、XTest 时，还会在隔离虚拟桌面中启动没有远程调试命令行参数的 Chrome，验证原生授权拒绝、允许与断开后保留浏览器。缺少这些测试环境组件时仅跳过原生弹窗测试；插件运行无需这些组件。
+`tests/test_browser_cdp.py` 使用临时用户数据目录启动独立调试浏览器，验证调试文件与端口校验、登录复用、页面范围、网络规则与弹窗、原生视口坐标、管理员权限及占用、失败与取消后的恢复、断线与退出清理，以及普通会话与共享渲染不受影响。自动连接测试覆盖 Chrome/Edge/Chromium 标准目录、多目标选择、自定义目录、手动 HTTP/WebSocket 地址及优先级、按端口补齐 WebSocket 路径、省略协议时的文件优先与同端口 HTTP 发现、Snap/Flatpak 目录、HTTP 重定向与返回地址校验、动态调试端口、授权等待与取消；Linux 安装 Xvfb、X11、XTest 时，还会在隔离虚拟桌面中启动没有远程调试命令行参数的 Chrome 和已安装的 Edge，验证原生授权拒绝、允许与断开后保留浏览器。缺少测试环境组件或对应浏览器时仅跳过相应的原生弹窗测试；插件运行无需这些组件。

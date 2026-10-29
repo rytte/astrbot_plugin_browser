@@ -1,6 +1,6 @@
 name: astrbot_plugin_browser
 display_name: 浏览器服务
 desc: 为 AstrBot Agent 提供网页浏览与自动化交互能力，并为其他插件提供基于共享 Chromium 的 HTML 截图与 PDF 渲染服务。
-version: 0.5.0
+version: 1.0.0
 author: rytte
 astrbot_version: ">=4.27,<5"

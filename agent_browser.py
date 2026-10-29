@@ -159,8 +159,9 @@ class AgentBrowser:
         data_dir: Plugin-owned directory for login snapshots and temporary files.
         tool_level: Cumulative model tool level: basic, standard or full.
         headed_enabled: Allow explicit requests for the exclusive visible session.
-        cdp_enabled: Allow explicitly discovering and connecting to the running Chrome.
-        cdp_user_data_dir: Optional Chrome user data root for automatic discovery.
+        cdp_enabled: Allow explicitly discovering and connecting to a local browser.
+        cdp_endpoint: Optional local debugging URL, overriding profile discovery.
+        cdp_user_data_dir: Optional browser user data root for automatic discovery.
         cdp_allow_existing_tabs: Allow explicitly selecting existing external pages.
     """
 
@@ -175,6 +176,7 @@ class AgentBrowser:
         tool_level: str = "basic",
         headed_enabled: bool = True,
         cdp_enabled: bool = False,
+        cdp_endpoint: str = "",
         cdp_user_data_dir: str = "",
         cdp_allow_existing_tabs: bool = False,
     ) -> None:
@@ -190,6 +192,7 @@ class AgentBrowser:
         self.headed_enabled = headed_enabled
         self.cdp = LocalCDP(
             enabled=cdp_enabled,
+            endpoint=cdp_endpoint,
             user_data_dir=cdp_user_data_dir,
             allow_existing_tabs=cdp_allow_existing_tabs,
         )
@@ -885,7 +888,7 @@ class AgentBrowser:
                 "TIMEOUT",
                 "JavaScript 执行超时，当前会话已关闭，请重新打开网站。操作可能已执行。"
                 if action == "evaluate"
-                else "连接当前 Chrome 超时，请检查远程调试开关并在浏览器授权窗口中点击允许；可调大 browser_use.action_timeout 后显式重试连接。"
+                else "连接本地浏览器超时，请检查远程调试开关并在浏览器授权窗口中点击允许；可调大 browser_use.action_timeout 后显式重试连接。"
                 if action == "mode" and arguments.get("mode") == "cdp"
                 else "浏览器工具超时；操作可能已执行，请重新观察确认结果，不要直接重复操作。",
             ) from exc
