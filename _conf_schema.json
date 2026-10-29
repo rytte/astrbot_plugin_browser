@@ -14,13 +14,13 @@
         "description": "最大并发页面任务数",
         "type": "int",
         "default": 4,
-        "hint": "允许 1～16。BrowserUse 操作和离线渲染共享执行名额；保留但未执行操作的浏览会话不占名额。"
+        "hint": "允许 1～16。保留但未执行操作的浏览会话不占名额。"
       },
       "queue_timeout": {
         "description": "任务排队超时（秒）",
         "type": "int",
         "default": 30,
-        "hint": "允许 1～300。BrowserUse 操作和离线渲染在执行名额满时，最多等待这些秒数；BrowserUse 同时受单次工具总超时限制。"
+        "hint": "允许 1～300。在达到最大并发页面任务数时，新任务最多等待的秒数；BrowserUse 同时受单次工具总超时限制。"
       },
       "startup_timeout": {
         "description": "浏览器启动超时（秒）",
@@ -32,7 +32,7 @@
         "description": "空闲时关闭浏览器",
         "type": "bool",
         "default": false,
-        "hint": "无头实例空闲超时后关闭，下次浏览或渲染时自动启动。保留会话、执行中和排队的任务会阻止关闭；保存后重载生效。"
+        "hint": "无头实例空闲超时后关闭，下次浏览或渲染时自动启动。保留会话、执行中和排队的任务会阻止关闭。"
       },
       "idle_shutdown_timeout": {
         "description": "浏览器实例空闲超时（秒）",
@@ -51,7 +51,7 @@
         "description": "启用共享渲染服务",
         "type": "bool",
         "default": true,
-        "hint": "向其他插件提供 HTML 截图、PDF 和临时页面接口。关闭后不影响 BrowserUse；两者都关闭时不初始化浏览器。"
+        "hint": "向其他插件提供 HTML 截图、PDF 和临时页面接口。"
       }
     }
   },
@@ -94,16 +94,16 @@
             "description": "允许连接本地浏览器（CDP）",
             "type": "bool",
             "default": false,
-            "hint": "仅在明确请求 cdp 模式时自动发现 AstrBot 所在主机上正在使用的 Chrome 144+；需先在 Chrome 启用远程调试，连接时点击允许。仅管理员可用，可通过使用者个人 ID 限定一名管理员，不影响共享渲染；保存后重载生效。"
+            "hint": "需先在 Chrome 启用远程调试，连接时点击允许。详情见 README。"
           },
           "user_data_dir": {
-            "description": "Chrome 用户数据根目录（可选）",
+            "description": "Chrome 用户数据根目录",
             "type": "string",
             "default": "",
             "condition": {
               "enabled": true
             },
-            "hint": "留空自动定位运行 AstrBot 的系统账户下稳定版 Chrome 的默认目录。自定义目录、其他通道或 Chromium 需填写绝对路径；取 chrome://version 中个人资料路径的上一级（不是 Default 或 Profile 1 子目录），不会创建或修改目录。"
+            "hint": "留空自动定位运行 AstrBot 的系统账户下稳定版 Chrome 的默认目录。自定义目录、其他通道或 Chromium 需填写绝对路径；取 chrome://version 中个人资料路径的上一级。"
           },
           "user_id": {
             "description": "CDP 使用者个人 ID",
@@ -112,7 +112,7 @@
             "condition": {
               "enabled": true
             },
-            "hint": "留空允许任意 AstrBot 管理员使用；填写后仅允许该 ID 对应的管理员使用。个人白名单不授予 CDP 权限，同一浏览器最多被一个聊天会话占用。"
+            "hint": "允许使用 CDP 的管理员 ID，留空允许任意 AstrBot 管理员使用。"
           },
           "allow_existing_tabs": {
             "description": "允许选择已有标签页",
@@ -121,7 +121,7 @@
             "condition": {
               "enabled": true
             },
-            "hint": "获授权的管理员可列出已有标签页并明确选择接入，退出连接时保留这些已有标签页；关闭后仅管理插件新建的标签页。"
+            "hint": "允许使用当前已打开的标签页，关闭后仅操作新建的标签页。"
           }
         }
       },
