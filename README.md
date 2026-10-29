@@ -1,5 +1,16 @@
 # 🌐 浏览器服务
 
+![rytte-browser](https://count.moeyy.cn/@rytte-browser?name=rytte-browser&theme=booru-yuyuyui&padding=7&offset=0&align=top&scale=0.9&pixelated=1&darkmode=auto)
+
+<p align="center">
+  <a href="https://github.com/rytte/astrbot_plugin_browser"><img src="https://img.shields.io/badge/dynamic/yaml?url=https%3A%2F%2Fraw.githubusercontent.com%2Frytte%2Fastrbot_plugin_browser%2Fmain%2Fmetadata.yaml&amp;query=%24.version&amp;label=version&amp;color=blue" alt="Version" /></a>
+  <a href="https://github.com/AstrBotDevs/AstrBot"><img src="https://img.shields.io/badge/AstrBot-%3E%3D4.27%2C%3C5-5965F2" alt="AstrBot" /></a>
+  <a href="https://www.python.org/"><img src="https://img.shields.io/badge/Python-3.10%2B-3776AB?logo=python&amp;logoColor=white" alt="Python" /></a>
+  <a href="https://playwright.dev/python/"><img src="https://img.shields.io/badge/Playwright-%3E%3D1.58%2C%3C2-2EAD33" alt="Playwright" /></a>
+  <a href="./LICENSE"><img src="https://img.shields.io/badge/License-AGPL--3.0-blue" alt="License" /></a>
+  <a href="https://github.com/rytte/astrbot_plugin_browser/stargazers"><img src="https://img.shields.io/github/stars/rytte/astrbot_plugin_browser?style=flat&amp;logo=github" alt="GitHub Stars" /></a>
+</p>
+
 让 AstrBot 浏览真实网页，也为其他插件提供共享的截图和 PDF 渲染服务。
 
 `astrbot_plugin_browser` 提供 **23 个 BrowserUse 模型工具**，覆盖网页阅读、鼠标与表单操作、文件上传下载、登录状态保存和高级控制；同时提供 **HTML → PNG / PDF** 接口，让 Markdown 渲染、网页卡片和报告导出等插件共用浏览器。
