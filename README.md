@@ -1,15 +1,14 @@
 # 🌐 浏览器服务
 
-![rytte-browser](https://count.moeyy.cn/@rytte-browser?name=rytte-browser&theme=booru-yuyuyui&padding=7&offset=0&align=top&scale=0.9&pixelated=1&darkmode=auto)
+![rytte-browser](https://count.moeyy.cn/@rytte-browser?name=rytte-browser&theme=booru-yuyuyui&padding=7&offset=0&align=top&scale=1.0&pixelated=1&darkmode=auto)
 
 <p align="center">
   <a href="https://github.com/rytte/astrbot_plugin_browser"><img src="https://img.shields.io/badge/dynamic/yaml?url=https%3A%2F%2Fraw.githubusercontent.com%2Frytte%2Fastrbot_plugin_browser%2Fmain%2Fmetadata.yaml&amp;query=%24.version&amp;label=version&amp;color=blue" alt="Version" /></a>
   <a href="https://github.com/AstrBotDevs/AstrBot"><img src="https://img.shields.io/badge/AstrBot-%3E%3D4.27%2C%3C5-5965F2" alt="AstrBot" /></a>
-  <a href="https://www.python.org/"><img src="https://img.shields.io/badge/Python-3.10%2B-3776AB?logo=python&amp;logoColor=white" alt="Python" /></a>
   <a href="https://playwright.dev/python/"><img src="https://img.shields.io/badge/Playwright-%3E%3D1.58%2C%3C2-2EAD33" alt="Playwright" /></a>
   <a href="./LICENSE"><img src="https://img.shields.io/badge/License-AGPL--3.0-blue" alt="License" /></a>
-  <a href="https://github.com/rytte/astrbot_plugin_browser/stargazers"><img src="https://img.shields.io/github/stars/rytte/astrbot_plugin_browser?style=flat&amp;logo=github" alt="GitHub Stars" /></a>
 </p>
+
 
 让 AstrBot 浏览真实网页，也为其他插件提供共享的截图和 PDF 渲染服务。
 
@@ -144,29 +143,25 @@
 | `standard` | 完整交互 | 19 | 增加拖拽、上传下载、结构化提取、弹窗和登录状态管理 |
 | `full` | 高级控制 | 23 | 增加网络监听、请求拦截、设备模拟和 JavaScript 执行 |
 
-登录状态的自动保存与恢复在三个层级均可用。完整工具清单与参数见 [BrowserUse 工具](./docs/BrowserUse.md#tools)。
+完整工具清单与参数见 [BrowserUse 工具](./docs/BrowserUse.md#tools)。
 
-### 谁可以使用
+### 优化功能
 
-管理员与白名单用户拥有相同的浏览器工具权限，可以在**私聊和任意群聊**中使用。
+| 功能 | 行为说明 |
+| --- | --- |
+| [页面观察精简](./docs/BrowserUse.md#history) | 用于优化网页工具返回的工具结果（主要是页面内容），造成的大量上下文占用。整轮最终回复后、保存历史前，精简本轮全部观察的网页正文、元素清单和截图。会保留网址、标题、正文提取、脚本执行结果、文件信息和错误。 |
+| [CDP 地址与目录发现](./docs/BrowserUse.md#cdp) | 自动查找 Chrome、Edge、Chromium 的标准用户数据目录并读取调试地址，重新连接时重新读取 |
+| [登录状态保存与恢复](./docs/BrowserUse.md#storage) | 正常结束、关闭最后一个标签页、空闲回收或正常停止插件时尝试保存，下次创建同一身份的会话时自动恢复；崩溃或强制终止可能丢失最新状态；CDP 使用外部浏览器自身的登录状态 |
+| [空闲会话回收](./docs/BrowserUse.md#lifecycle) | 自动回收长时间未操作的 Agent 会话，释放页面资源 |
+| [无头浏览器空闲关闭](./docs/共享浏览器.md#lifecycle) | 没有任务和保留的无头会话后计时关闭实例，下次浏览或渲染请求自动启动 |
 
-不同聊天来源和发送者的页面、文件与登录快照分别隔离。同一个人在不同聊天中的会话也相互独立。授权只匹配发送者 ID，多平台使用时，相同发送者 ID 会命中同一白名单条目。
+### 权限与规则
 
-BrowserUse 使用 AstrBot 所在主机的网络和网站登录状态，请仅向可信用户授权。供其他插件调用的离线渲染接口不受个人白名单限制。详见 [权限与会话隔离](./docs/BrowserUse.md#permissions)。
-
-### 会话隔离
-
-每个 Agent 使用者及每个离线渲染任务使用独立的 BrowserContext。
-
-不同上下文之间不共享 Cookie、Local Storage 和页面状态；同一 Agent 会话内部保留状态，便于连续操作。
-
-### 有头浏览与登录保存
-
-默认浏览在后台运行。明确请求有头模式时，窗口显示在 **AstrBot 所在主机**，最多一个有头实例和一个有头会话；会话结束后释放。
-
-正常结束会话、通过工具关闭最后一个标签页、空闲回收或正常停止插件时，会尝试保存登录状态，下次创建同一身份的会话时自动恢复。浏览器崩溃或强制结束进程时，无法保证保存最新状态。
-
-有头与无头之间切换会保留登录存储并重建页面，需要重新打开网址。详细行为见 [有头模式与人工操作](./docs/BrowserUse.md#headed) 和 [登录状态与文件](./docs/BrowserUse.md#storage)。
+| 功能                                              | 行为说明                                                     |
+| ------------------------------------------------- | ------------------------------------------------------------ |
+| [使用权限](./docs/BrowserUse.md#permissions)      | 管理员与白名单用户可在私聊和任意群聊使用；白名单仅匹配发送者 ID，同 ID 跨平台通用 |
+| [会话隔离](./docs/BrowserUse.md#permissions)      | 页面、文件和登录快照按聊天来源、发送者隔离；不同上下文不共享 Cookie、Local Storage 和页面状态 |
+| [有头浏览与模式切换](./docs/BrowserUse.md#headed) | 默认后台浏览；明确请求后在 AstrBot 所在主机显示窗口，会话结束后释放；最多一个有头实例和一个有头会话；切换有头/无头模式保留登录存储并重建页面，需重新打开网址 |
 
 ## 🧬 共享渲染服务
 

@@ -1,6 +1,7 @@
+import asyncio
 import base64
 import json
-from copy import copy
+from copy import copy, deepcopy
 from functools import partial
 from pathlib import Path
 from types import SimpleNamespace
@@ -145,6 +146,12 @@ def test_plugin_reads_grouped_browser_use_settings():
     assert plugin.user_whitelist == {"alice", "bob"}
 
 
+@pytest.mark.parametrize("value", [None, 0, 1, "false", []])
+def test_plugin_rejects_invalid_history_compaction_setting(value):
+    with pytest.raises(BrowserServiceError, match="compact_history 必须是布尔值"):
+        BrowserPlugin(SimpleNamespace(), {"browser_use": {"compact_history": value}})
+
+
 @pytest.mark.parametrize(
     ("config", "error"),
     [
@@ -202,6 +209,7 @@ def test_schema_loads_configuration_groups(tmp_path):
         "render": {"enabled": True},
         "browser_use": {
             "enabled": True,
+            "compact_history": True,
             "headed_enabled": True,
             "cdp": {
                 "enabled": False,
@@ -379,6 +387,35 @@ def event(sender="alice", origin="test:group:one", *, admin=True):
         get_extra=lambda key: None,
         is_admin=lambda: admin,
     )
+
+
+def observation_messages(call_id, text):
+    from astrbot.core.agent.message import Message, ToolCall
+
+    return [
+        Message(
+            role="assistant",
+            tool_calls=[
+                ToolCall(
+                    id=call_id,
+                    function=ToolCall.FunctionBody(
+                        name="browser_observe", arguments="{}"
+                    ),
+                )
+            ],
+        ),
+        Message(
+            role="tool",
+            tool_call_id=call_id,
+            content=json.dumps(
+                {
+                    "success": True,
+                    "observation_id": f"obs_{call_id}",
+                    "frames": [{"text": text}],
+                }
+            ),
+        ),
+    ]
 
 
 @pytest.mark.parametrize("enabled", [False, True])
@@ -836,6 +873,320 @@ async def test_screenshot_reaches_next_model_request(tmp_path, monkeypatch):
     assert encoded in str(contexts)
     assert "image_url" in str(contexts)
     message_event.send.assert_not_awaited()
+
+
+@pytest.mark.parametrize("enabled", [True, False])
+@pytest.mark.parametrize("batched", [True, False])
+async def test_history_compaction_only_after_final_response_and_before_history_save(
+    enabled, batched, tmp_path, monkeypatch
+):
+    from astrbot.api import FunctionTool, ToolSet
+    from astrbot.core.agent.hooks import BaseAgentRunHooks
+    from astrbot.core.agent.run_context import ContextWrapper
+    from astrbot.core.agent.runners.tool_loop_agent_runner import ToolLoopAgentRunner
+    from astrbot.core.agent.tool_image_cache import tool_image_cache
+    from astrbot.core.astr_agent_tool_exec import FunctionToolExecutor
+    from astrbot.core.pipeline.process_stage.method.agent_sub_stages.internal import (
+        InternalAgentSubStage,
+    )
+    from astrbot.core.provider.entities import LLMResponse, ProviderRequest
+
+    monkeypatch.setattr(tool_image_cache, "_cache_dir", str(tmp_path))
+    provider = SimpleNamespace(
+        provider_config={"id": "test", "modalities": ["text", "image", "tool_use"]}
+    )
+    responses = (
+        [
+            LLMResponse(
+                role="assistant",
+                completion_text="",
+                tools_call_name=["browser_screenshot", "browser_screenshot"],
+                tools_call_args=[{}, {}],
+                tools_call_ids=["history-first", "history-second"],
+            )
+        ]
+        if batched
+        else [
+            LLMResponse(
+                role="assistant",
+                completion_text="",
+                tools_call_name=["browser_screenshot"],
+                tools_call_args=[{}],
+                tools_call_ids=["history-first"],
+            ),
+            LLMResponse(
+                role="assistant",
+                completion_text="",
+                tools_call_name=["browser_screenshot"],
+                tools_call_args=[{}],
+                tools_call_ids=["history-second"],
+            ),
+        ]
+    )
+    provider.text_chat = AsyncMock(
+        side_effect=[
+            *responses,
+            LLMResponse(role="assistant", completion_text="已查看页面"),
+        ]
+    )
+    plugin = BrowserPlugin(
+        SimpleNamespace(get_using_provider_async=AsyncMock(return_value=provider)),
+        {"browser_use": {"compact_history": enabled}},
+    )
+    images = [b"first-browser-image", b"second-browser-image"]
+    plugin.agent.execute = AsyncMock(
+        side_effect=[
+            BrowserResult(
+                {
+                    "success": True,
+                    "observation_id": f"obs_{index}",
+                    "url": "https://example.com",
+                    "title": "测试页面",
+                    "frames": [{"text": f"page-{index}-" * 2000}],
+                },
+                image=png,
+            )
+            for index, png in enumerate(images)
+        ]
+    )
+    message_event = event()
+    message_event.send = AsyncMock()
+    message_event.get_result = Mock(return_value=None)
+
+    class HistoryHooks(BaseAgentRunHooks):
+        async def on_agent_begin(self, run_context):
+            await plugin.prepare_browser_history(message_event, run_context)
+
+        async def on_agent_done(self, run_context, response):
+            await plugin.finish_browser_history(message_event, run_context, response)
+
+    tool = FunctionTool(
+        name="browser_screenshot",
+        description="Screenshot",
+        parameters={"type": "object", "properties": {}},
+        handler=plugin.browser_screenshot,
+    )
+    previous_history = [
+        *observation_messages("previous-first", "上一轮较早的观察"),
+        *observation_messages("previous-latest", "上一轮最后的观察"),
+    ]
+    previous_history = [message.model_dump() for message in previous_history]
+    original_history = deepcopy(previous_history)
+    runner = ToolLoopAgentRunner()
+    await runner.reset(
+        provider=provider,
+        request=ProviderRequest(
+            prompt="连续观察页面",
+            contexts=previous_history,
+            func_tool=ToolSet(tools=[tool]),
+        ),
+        run_context=ContextWrapper(context=SimpleNamespace(event=message_event)),
+        tool_executor=FunctionToolExecutor(),
+        agent_hooks=HistoryHooks(),
+    )
+    async for _ in runner.step_until_done(3):
+        pass
+
+    first_context = provider.text_chat.await_args_list[1].kwargs["contexts"]
+    final_context = provider.text_chat.await_args_list[-1].kwargs["contexts"]
+    first_encoded, latest_encoded = [base64.b64encode(png).decode() for png in images]
+    assert "page-0-" in str(first_context)
+    assert first_encoded in str(first_context)
+    assert "page-0-" in str(final_context)
+    assert first_encoded in str(final_context)
+    assert "page-1-" in str(final_context)
+    assert latest_encoded in str(final_context)
+    assert [
+        (item["role"], item.get("tool_call_id"))
+        for item in final_context
+        if item["role"] == "tool"
+    ] == [
+        ("tool", "previous-first"),
+        ("tool", "previous-latest"),
+        ("tool", "history-first"),
+        ("tool", "history-second"),
+    ]
+    for call in provider.text_chat.await_args_list:
+        assert call.kwargs["contexts"][: len(original_history)] == original_history
+
+    # Exercise AstrBot's real save path with a fake database writer.
+    runner.req.conversation = SimpleNamespace(cid="browser-test", token_usage=0)
+    manager = SimpleNamespace(update_conversation=AsyncMock())
+    await InternalAgentSubStage._save_to_history(
+        SimpleNamespace(conv_manager=manager),
+        message_event,
+        runner.req,
+        runner.get_final_llm_resp(),
+        runner.run_context.messages,
+        runner.stats,
+    )
+    saved = manager.update_conversation.await_args.kwargs["history"]
+    assert saved[: len(original_history)] == original_history
+    assert previous_history == original_history
+    assert ("page-0-" in str(saved)) is (not enabled)
+    assert (first_encoded in str(saved)) is (not enabled)
+    assert ("page-1-" in str(saved)) is (not enabled)
+    assert (latest_encoded in str(saved)) is (not enabled)
+    assert plugin._history_boundaries.get() == ()
+    message_event.send.assert_not_awaited()
+
+
+async def test_history_compaction_isolated_between_concurrent_runs():
+    from astrbot.core.agent.message import Message
+    from astrbot.core.agent.run_context import ContextWrapper
+    from astrbot.core.provider.entities import LLMResponse
+
+    plugin = BrowserPlugin(SimpleNamespace(), {})
+    started = asyncio.Event()
+    waiting = 0
+
+    async def execute(owner, action, **arguments):
+        if owner[1] == "bob":
+            raise AgentBrowserError("TIMEOUT", "页面观察超时")
+        return BrowserResult(
+            {"success": True, "observation_id": "obs_new", "frames": []}
+        )
+
+    plugin.agent.execute = AsyncMock(side_effect=execute)
+
+    async def run(sender):
+        nonlocal waiting
+        current = event(sender=sender)
+        history = observation_messages("previous", f"{sender}的历史页面")
+        run_context = ContextWrapper(
+            context=SimpleNamespace(event=current),
+            messages=[*history, Message(role="user", content="继续浏览")],
+        )
+        await plugin.prepare_browser_history(current, run_context)
+        run_context.messages.extend(
+            observation_messages("first", f"{sender}的本轮页面")
+        )
+        waiting += 1
+        if waiting == 2:
+            started.set()
+        await started.wait()
+        result = await plugin.browser_observe(current)
+        assert "observation_compacted" not in str(run_context.messages)
+        if not result.isError:
+            run_context.messages.extend(observation_messages("latest", "最新页面"))
+        response = LLMResponse(role="assistant", completion_text="浏览结束")
+        run_context.messages.append(Message(role="assistant", content="浏览结束"))
+        await plugin.finish_browser_history(current, run_context, response)
+        assert run_context.messages[:2] == history
+        assert plugin._history_boundaries.get() == ()
+        return result, json.loads(run_context.messages[4].content)
+
+    (alice_result, alice_previous), (bob_result, bob_previous) = await asyncio.gather(
+        run("alice"),
+        run("bob"),
+    )
+    assert not alice_result.isError
+    assert alice_previous["observation_compacted"] is True
+    assert bob_result.isError
+    assert bob_previous["observation_compacted"] is True
+    assert "frames" not in bob_previous
+    assert plugin._history_boundaries.get() == ()
+
+
+@pytest.mark.parametrize("boundary_state", ["kept", "shifted", "removed"])
+async def test_completed_run_compacts_only_new_messages_after_boundary(boundary_state):
+    from astrbot.core.agent.message import Message
+    from astrbot.core.agent.run_context import ContextWrapper
+    from astrbot.core.provider.entities import LLMResponse
+
+    plugin = BrowserPlugin(SimpleNamespace(), {})
+    current = event()
+    history = [
+        *observation_messages("old-first", "历史页面一"),
+        *observation_messages("old-last", "历史页面二"),
+    ]
+    original = deepcopy(history)
+    boundary = Message(role="user", content="本轮请求")
+    run_context = ContextWrapper(
+        context=SimpleNamespace(), messages=[*history, boundary]
+    )
+    await plugin.prepare_browser_history(current, run_context)
+    assert run_context.messages == [*original, boundary]
+    if boundary_state == "shifted":
+        run_context.messages = run_context.messages[2:]
+    elif boundary_state == "removed":
+        run_context.messages = [*history]
+    run_context.messages.extend(
+        [
+            *observation_messages("new-first", "本轮页面一"),
+            *observation_messages("new-last", "本轮页面二"),
+            Message(role="assistant", content="最终答复"),
+        ]
+    )
+    response = LLMResponse(role="assistant", completion_text="最终答复")
+    await plugin.finish_browser_history(current, run_context, response)
+    assert history == original
+    earlier = json.loads(run_context.messages[-4].content)
+    assert earlier.get("observation_compacted", False) is (boundary_state != "removed")
+    last = json.loads(run_context.messages[-2].content)
+    assert last.get("observation_compacted", False) is (boundary_state != "removed")
+
+    # Reload the completed turn and run again: its serialized prefix stays exact.
+    saved = [message.model_dump() for message in run_context.messages]
+    reloaded = ContextWrapper(
+        context=SimpleNamespace(),
+        messages=[
+            *[Message.model_validate(message) for message in saved],
+            Message(role="user", content="下一轮请求"),
+        ],
+    )
+    await plugin.prepare_browser_history(current, reloaded)
+    reloaded.messages.extend(
+        [
+            *observation_messages("next-first", "下一轮页面一"),
+            *observation_messages("next-last", "下一轮页面二"),
+            Message(role="assistant", content="下一轮答复"),
+        ]
+    )
+    await plugin.finish_browser_history(current, reloaded, response)
+    assert [
+        message.model_dump() for message in reloaded.messages[: len(saved)]
+    ] == saved
+    assert plugin._history_boundaries.get() == ()
+
+
+@pytest.mark.parametrize(
+    "response_kind", ["missing", "tool_call", "error", "untracked"]
+)
+async def test_history_compaction_skips_without_tracked_final_response(response_kind):
+    from astrbot.core.agent.message import Message
+    from astrbot.core.agent.run_context import ContextWrapper
+    from astrbot.core.provider.entities import LLMResponse
+
+    plugin = BrowserPlugin(SimpleNamespace(), {})
+    current = event()
+    run_context = ContextWrapper(
+        context=SimpleNamespace(),
+        messages=[
+            Message(role="user", content="本轮请求"),
+        ],
+    )
+    if response_kind != "untracked":
+        await plugin.prepare_browser_history(current, run_context)
+    run_context.messages.extend(
+        [
+            *observation_messages("first", "页面一"),
+            *observation_messages("last", "页面二"),
+        ]
+    )
+    response = None
+    if response_kind == "tool_call":
+        response = LLMResponse(
+            role="assistant", completion_text="", tools_call_name=["browser_observe"]
+        )
+    elif response_kind == "error":
+        response = LLMResponse(role="err", completion_text="执行失败")
+    elif response_kind == "untracked":
+        response = LLMResponse(role="assistant", completion_text="最终答复")
+    original = deepcopy(run_context.messages)
+    await plugin.finish_browser_history(current, run_context, response)
+    assert run_context.messages == original
+    assert plugin._history_boundaries.get() == ()
 
 
 async def test_screenshot_checks_explicitly_selected_provider():
