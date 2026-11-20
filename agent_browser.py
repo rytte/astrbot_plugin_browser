@@ -207,6 +207,7 @@ class AgentBrowser:
         self._registry_lock = asyncio.Lock()
         self._owner_locks: dict[Owner, asyncio.Lock] = {}
         self._creating: set[Owner] = set()
+        self.manual_login_owner: Owner | None = None
         self._headed_owner: Owner | None = None
         self._cdp_owner: Owner | None = None
         self._tasks: set[asyncio.Task[Any]] = set()
@@ -921,6 +922,11 @@ class AgentBrowser:
         async with self._owner_lock(owner):
             if self._closed:
                 raise AgentBrowserError("SERVICE_CLOSED", "Agent 浏览器服务已停止。")
+            if self.manual_login_owner == owner:
+                raise AgentBrowserError(
+                    "MANUAL_LOGIN_ACTIVE",
+                    "此浏览器会话正在人工登录，请等待管理员完成。",
+                )
             current = self._sessions.get(owner)
             if (action == "mode" and args.get("mode") == "cdp") or (
                 current is not None and current.mode == "cdp"

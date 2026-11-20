@@ -8,16 +8,21 @@ import json
 from contextvars import ContextVar
 from pathlib import Path
 
+import jwt
 from astrbot.api import AstrBotConfig, llm_tool
 from astrbot.api.event import AstrMessageEvent, filter
 from astrbot.api.message_components import File, Image
 from astrbot.api.star import Context, Star, StarTools
+from astrbot.api.web import error_response, json_response, request
 from astrbot.core.agent.message import Message
 from astrbot.core.agent.run_context import ContextWrapper
+from astrbot.dashboard.services.auth_service import DASHBOARD_JWT_COOKIE_NAME
 from mcp.types import CallToolResult, ImageContent, TextContent
+from playwright.async_api import Error as PlaywrightError
 
 from .agent_browser import AgentBrowser, AgentBrowserError
 from .browser_history import compact_observations
+from .manual_login import ManualLogin
 from .render_api import BrowserServiceAPI
 from .service import BrowserService, BrowserServiceError
 
@@ -144,9 +149,16 @@ class BrowserPlugin(Star):
             cdp_allow_existing_tabs=cdp.get("allow_existing_tabs", True),
         )
         self._tool_tasks: set[asyncio.Task] = set()
+        self.manual_login = ManualLogin(self.agent)
 
     async def initialize(self) -> None:
         """Start the browser only when browsing or rendering is enabled."""
+        self.context.register_web_api(
+            "/astrbot_plugin_browser/manual-login",
+            self.manual_login_api,
+            ["POST"],
+            "Administrator browser login",
+        )
         # Remove definitions entirely without changing AstrBot's persisted
         # per-tool activation choices. Reloading re-registers the decorators.
         manager = self.context.get_llm_tool_manager()
@@ -171,9 +183,94 @@ class BrowserPlugin(Star):
     async def terminate(self) -> None:
         """Stop active sessions and release the browser process."""
         try:
-            await self.agent.close(pending_tasks=self._tool_tasks)
+            try:
+                await self.manual_login.close()
+            finally:
+                await self.agent.close(pending_tasks=self._tool_tasks)
         finally:
             await self._service.close()
+
+    @filter.command("browser_login")
+    async def request_browser_login(self, event: AstrMessageEvent):
+        """Bind a login request to the chat and sender verified by AstrBot."""
+        if not event.is_admin():
+            yield event.plain_result("仅 AstrBot 管理员可申请人工登录。")
+            return
+        if not self.browser_use_enabled:
+            yield event.plain_result("请先启用 BrowserUse。")
+            return
+        try:
+            await self.manual_login.request(
+                (event.unified_msg_origin, event.get_sender_id())
+            )
+        except AgentBrowserError as exc:
+            yield event.plain_result(str(exc))
+            return
+        yield event.plain_result(
+            "已申请人工登录。请在 2 分钟内打开 AstrBot WebUI → 浏览器服务 → 人工登录，"
+            "核对聊天来源和发送者后开始。请勿在聊天中发送密码或验证码。"
+        )
+
+    async def manual_login_api(self):
+        """Handle the Dashboard's authenticated browser controls."""
+        headers = {"Cache-Control": "no-store", "Referrer-Policy": "no-referrer"}
+        username = request.username
+        dashboard_user = self.context.get_config().get("dashboard", {}).get("username")
+        if (
+            not username
+            or username.startswith("api_key:")
+            or username != dashboard_user
+        ):
+            return error_response(
+                "仅 Dashboard 管理员可操作。", status_code=403, headers=headers
+            )
+        authorization = request.headers.get("authorization", "").strip()
+        jwt_token = (
+            authorization.removeprefix("Bearer ").strip()
+            if authorization.startswith("Bearer ")
+            else ""
+        ) or request.cookies.get(DASHBOARD_JWT_COOKIE_NAME, "").strip()
+        # The extension router already validates the JWT. Reject scoped resource
+        # tokens even when they carry the same Dashboard username.
+        try:
+            claims = jwt.decode(jwt_token, options={"verify_signature": False})
+        except jwt.InvalidTokenError:
+            claims = {}
+        if claims.get("username") != username or "token_type" in claims:
+            return error_response(
+                "需要有效的 Dashboard 登录会话。", status_code=403, headers=headers
+            )
+        if not self.browser_use_enabled:
+            return error_response(
+                "请先启用 BrowserUse。", status_code=409, headers=headers
+            )
+        if (
+            request.headers.get("sec-fetch-site", "same-origin") != "same-origin"
+            or (request.content_type or "").split(";", 1)[0] != "application/json"
+            or len(await request.body()) > 8192
+        ):
+            return error_response("无效的接管请求。", headers=headers)
+        payload = await request.json()
+        if not isinstance(payload, dict):
+            return error_response("无效的接管请求。", headers=headers)
+        try:
+            result = await asyncio.wait_for(
+                self.manual_login.operate(username, payload), 15
+            )
+            return json_response(result, headers=headers)
+        except AgentBrowserError as exc:
+            return json_response(
+                {"error": exc.code, "message": str(exc)}, headers=headers
+            )
+        except (PlaywrightError, BrowserServiceError, asyncio.TimeoutError, OSError):
+            # Playwright exceptions may include a URL or input in the call log.
+            return json_response(
+                {
+                    "error": "LOGIN_BROWSER",
+                    "message": "浏览器操作未完成，请刷新画面后重试。",
+                },
+                headers=headers,
+            )
 
     @filter.on_agent_begin()
     async def prepare_browser_history(
@@ -234,6 +331,11 @@ class BrowserPlugin(Star):
             self.agent.require_action(action)
             owner = (event.unified_msg_origin, event.get_sender_id())
             self.agent.validate_owner(owner)
+            if self.agent.manual_login_owner == owner:
+                raise AgentBrowserError(
+                    "MANUAL_LOGIN_ACTIVE",
+                    "此浏览器会话正在人工登录，请等待管理员完成。",
+                )
             cdp_authorized = (
                 (not self.cdp_user_id or event.get_sender_id() == self.cdp_user_id)
                 and callable(getattr(event, "is_admin", None))
