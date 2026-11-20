@@ -82,6 +82,98 @@ def test_plugin_rejects_unknown_settings():
         BrowserPlugin(SimpleNamespace(), {"unrecognized": True})
 
 
+async def test_manual_login_dashboard_route_rejects_api_keys_and_other_users():
+    import jwt
+    from astrbot.dashboard.api.plugins import router
+    from astrbot.dashboard.responses import ApiError
+    from astrbot.dashboard.services.auth_service import DASHBOARD_JWT_COOKIE_NAME
+    from fastapi import FastAPI
+    from fastapi.responses import JSONResponse
+    from httpx import ASGITransport, AsyncClient
+
+    context = SimpleNamespace(
+        get_config=lambda: {"dashboard": {"username": "admin"}},
+        registered_web_apis=[],
+        get_llm_tool_manager=lambda: SimpleNamespace(func_list=[]),
+    )
+    context.register_web_api = lambda *args: context.registered_web_apis.append(args)
+    plugin = BrowserPlugin(
+        context, {"browser_use": {"enabled": False}, "render": {"enabled": False}}
+    )
+    await plugin.initialize()
+    # Exercise status without starting Chromium.
+    plugin.browser_use_enabled = True
+    app = FastAPI()
+    app.state.core_lifecycle = SimpleNamespace(star_context=context)
+    app.state.jwt_secret = "test-key-for-manual-login-route-32b"
+    app.state.db = SimpleNamespace(
+        get_active_api_key_by_hash=AsyncMock(
+            return_value=SimpleNamespace(scopes=["plugin"], key_id="test")
+        ),
+        touch_api_key=AsyncMock(),
+    )
+    app.include_router(router, prefix="/api/v1")
+
+    @app.exception_handler(ApiError)
+    async def api_error(_, exc):
+        return JSONResponse(status_code=exc.status_code, content={"error": exc.message})
+
+    endpoint = "/api/v1/plugins/extensions/astrbot_plugin_browser/manual-login"
+    body = {"action": "status"}
+    async with AsyncClient(
+        transport=ASGITransport(app=app), base_url="https://dashboard.test"
+    ) as client:
+        assert (await client.post(endpoint, json=body)).status_code == 401
+        assert (
+            await client.post(endpoint, json=body, headers={"X-API-Key": "plugin-key"})
+        ).status_code == 403
+        asset_token = jwt.encode(
+            {"username": "admin", "token_type": "plugin_page_asset"},
+            app.state.jwt_secret,
+            algorithm="HS256",
+        )
+        assert (
+            await client.post(
+                endpoint, json=body, headers={"Authorization": f"Bearer {asset_token}"}
+            )
+        ).status_code == 403
+        for username in ("other", "admin"):
+            token = jwt.encode(
+                {"username": username}, app.state.jwt_secret, algorithm="HS256"
+            )
+            headers = {"Authorization": f"Bearer {token}"}
+            response = await client.post(endpoint, json=body, headers=headers)
+            if username == "other":
+                assert response.status_code == 403
+            else:
+                assert response.json() == {"busy": False, "offer": None}
+                assert response.headers["cache-control"] == "no-store"
+                client.cookies.set(DASHBOARD_JWT_COOKIE_NAME, token)
+                denied = event(admin=False)
+                denied.plain_result = str
+                assert "仅 AstrBot 管理员" in await anext(
+                    plugin.request_browser_login(denied)
+                )
+                allowed = event()
+                allowed.plain_result = str
+                assert "已申请人工登录" in await anext(
+                    plugin.request_browser_login(allowed)
+                )
+                cookie_response = await client.post(endpoint, json=body)
+                offer = cookie_response.json()["offer"]
+                assert (offer["origin"], offer["sender"]) == (
+                    allowed.unified_msg_origin,
+                    allowed.get_sender_id(),
+                )
+                response = await client.post(
+                    endpoint,
+                    json=body,
+                    headers={**headers, "Sec-Fetch-Site": "cross-site"},
+                )
+                assert response.status_code == 400
+    await plugin.terminate()
+
+
 @pytest.mark.parametrize(
     ("config", "error"),
     [
@@ -268,7 +360,9 @@ async def test_disabled_browser_use_removes_tool_definitions(tool_manager, level
         handler_module_path="other_plugin.main",
     )
     tool_manager.func_list.append(other)
-    context = SimpleNamespace(get_llm_tool_manager=lambda: tool_manager)
+    context = SimpleNamespace(
+        get_llm_tool_manager=lambda: tool_manager, register_web_api=Mock()
+    )
     plugin = BrowserPlugin(
         context,
         {
@@ -305,7 +399,9 @@ async def test_disabled_browser_use_removes_tool_definitions(tool_manager, level
 
 async def test_enabled_browser_use_preserves_tool_activation(tool_manager):
     tool_manager.get_func("browser_open").active = False
-    context = SimpleNamespace(get_llm_tool_manager=lambda: tool_manager)
+    context = SimpleNamespace(
+        get_llm_tool_manager=lambda: tool_manager, register_web_api=Mock()
+    )
     plugin = BrowserPlugin(context, {"browser_use": {"enabled": True}})
     plugin._service.initialize = AsyncMock()
     plugin._service.close = AsyncMock()
@@ -326,7 +422,10 @@ async def test_enabled_browser_use_preserves_tool_activation(tool_manager):
 
 async def test_plugin_lifecycle_delegates_to_service(tool_manager):
     plugin = BrowserPlugin(
-        SimpleNamespace(get_llm_tool_manager=lambda: tool_manager), {}
+        SimpleNamespace(
+            get_llm_tool_manager=lambda: tool_manager, register_web_api=Mock()
+        ),
+        {},
     )
     plugin._service.initialize = AsyncMock()
     plugin._service.close = AsyncMock()
@@ -344,7 +443,9 @@ async def test_render_and_browser_use_switches_are_independent(
     tool_manager, render_enabled, browser_use_enabled
 ):
     plugin = BrowserPlugin(
-        SimpleNamespace(get_llm_tool_manager=lambda: tool_manager),
+        SimpleNamespace(
+            get_llm_tool_manager=lambda: tool_manager, register_web_api=Mock()
+        ),
         {
             "render": {"enabled": render_enabled},
             "browser_use": {"enabled": browser_use_enabled},
@@ -429,7 +530,9 @@ async def test_invalid_cdp_address_does_not_prevent_plugin_loading(
     start = Mock(side_effect=AssertionError("Do not connect an invalid CDP address"))
     monkeypatch.setattr("astrbot_plugin_browser.browser_cdp.async_playwright", start)
     plugin = BrowserPlugin(
-        SimpleNamespace(get_llm_tool_manager=lambda: tool_manager),
+        SimpleNamespace(
+            get_llm_tool_manager=lambda: tool_manager, register_web_api=Mock()
+        ),
         {"browser_use": {"cdp": {"enabled": enabled, "endpoint": endpoint}}},
     )
     plugin._service.initialize = AsyncMock()
@@ -1339,7 +1442,9 @@ async def test_tool_levels_expose_exact_definitions_without_changing_other_plugi
         handler_module_path="other_plugin.main",
     )
     tool_manager.func_list.append(other)
-    context = SimpleNamespace(get_llm_tool_manager=lambda: tool_manager)
+    context = SimpleNamespace(
+        get_llm_tool_manager=lambda: tool_manager, register_web_api=Mock()
+    )
     plugin = BrowserPlugin(context, {"browser_use": {"tool_level": level}})
     plugin._service.initialize = AsyncMock()
     plugin._service.close = AsyncMock()
@@ -1359,7 +1464,9 @@ async def test_tool_levels_expose_exact_definitions_without_changing_other_plugi
 async def test_enabling_all_advanced_tools_exposes_23_and_preserves_activation(
     tool_manager,
 ):
-    context = SimpleNamespace(get_llm_tool_manager=lambda: tool_manager)
+    context = SimpleNamespace(
+        get_llm_tool_manager=lambda: tool_manager, register_web_api=Mock()
+    )
     plugin = BrowserPlugin(context, {"browser_use": {"tool_level": "full"}})
     plugin._service.initialize = AsyncMock()
     plugin._service.close = AsyncMock()

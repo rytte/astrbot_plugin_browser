@@ -1,0 +1,39 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>人工登录</title>
+    <link rel="stylesheet" href="./style.css">
+    <script type="module" src="./app.js"></script>
+  </head>
+  <body>
+    <main>
+      <h1>人工登录</h1>
+      <p id="status" role="status">正在连接 AstrBot…</p>
+      <form id="start" hidden>
+        <p id="target"></p>
+        <label for="url">网站登录地址</label>
+        <div class="actions">
+          <input id="url" type="url" placeholder="https://" required maxlength="2048" autocomplete="off">
+          <button type="submit" class="primary">开始接管</button>
+        </div>
+      </form>
+      <button id="refresh" type="button" hidden>检查申请</button>
+      <section id="console" aria-label="浏览器操作" hidden>
+        <div class="actions toolbar">
+          <label for="tabs">浏览器标签页</label>
+          <select id="tabs" aria-label="浏览器标签页"></select>
+          <button id="cancel" type="button">取消登录</button>
+          <button id="save" type="button" class="primary" disabled>保存登录态并交还</button>
+        </div>
+        <img id="screen" alt="容器内的浏览器画面，点击后可输入" tabindex="0" draggable="false" hidden>
+        <form id="send" class="actions">
+          <label for="text">粘贴或使用输入法</label>
+          <input id="text" type="password" autocomplete="off" maxlength="1024">
+          <button type="submit">发送到浏览器</button>
+        </form>
+      </section>
+    </main>
+  </body>
+</html>

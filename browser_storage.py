@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import json
+import os
 import re
 import tempfile
 import uuid
@@ -177,7 +178,7 @@ class BrowserStorage:
 
     def state_path(self, owner: Owner) -> Path:
         folder = self.root() / "login_states"
-        folder.mkdir(exist_ok=True)
+        folder.mkdir(mode=0o700, exist_ok=True)
         return folder / (owner_key(owner) + ".json")
 
     def read_state(self, owner: Owner) -> dict[str, Any]:
@@ -205,14 +206,19 @@ class BrowserStorage:
         if len(content) > MAX_STATE_BYTES:
             raise AgentBrowserError("STATE_LIMIT", "登录状态超过 20 MiB，未保存。")
         path = self.state_path(owner)
-        temporary = path.with_suffix(".tmp")
+        temporary = None
         try:
-            with temporary.open("wb") as output:
+            with tempfile.NamedTemporaryFile(
+                mode="wb", dir=path.parent, suffix=".tmp", delete=False
+            ) as output:
+                temporary = Path(output.name)
                 output.write(content)
-            temporary.chmod(0o600)
+                output.flush()
+                os.fsync(output.fileno())
             temporary.replace(path)
         finally:
-            temporary.unlink(missing_ok=True)
+            if temporary is not None:
+                temporary.unlink(missing_ok=True)
 
     def close(self) -> None:
         if self._file_root is not None:
